@@ -22,9 +22,41 @@ The element has unit in-plane dimensions (1 m × 1 m), so all inputs and outputs
 
 From these, the model derives reinforcement layer positions, areas per unit width, and the resulting layered cross-section used in the analysis.
 
+## Project structure
+
+```
+src/shell_layer/
+    materials.py   Concrete and reinforcing steel material models
+    geometry.py    ShellParameters, ReinforcementLayout (thickness, cover, bar diameter, spacing)
+    layers.py      Discretization into concrete sub-layers and smeared reinforcement layers
+    section.py     LayeredSection: assembles the 6x6 stiffness matrix (A/B/D)
+    loading.py     SectionForces (n_xx, n_yy, n_xy, m_xx, m_yy, m_xy)
+    solver.py      Linear-elastic solve: forces -> mid-surface strains/curvatures -> per-layer stress/strain
+    results.py     AnalysisResult / LayerResult containers
+tests/             pytest unit tests
+examples/          Example usage scripts
+```
+
+The current solver is linear-elastic (uncracked, non-yielding). Nonlinear
+concrete (cracking, crushing) and steel (yielding) behaviour are the natural
+next step, and the layered discretization is already structured for it: swap
+each layer's constant `stiffness_matrix()` for a strain-dependent tangent and
+iterate to equilibrium.
+
+## Getting started
+
+```bash
+python -m venv .venv
+.venv\Scripts\pip install -e ".[dev]"
+.venv\Scripts\pytest
+.venv\Scripts\python examples\basic_analysis.py
+```
+
 ## Status
 
-Early-stage / work in progress. Core layered cross-section model and stress/strain solver are under development.
+Early-stage / work in progress. Linear-elastic layered cross-section model
+and solver are implemented; nonlinear material behaviour is not yet
+implemented.
 
 ## License
 
