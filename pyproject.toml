@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shell-layer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Layered-section analysis of reinforced concrete shell elements"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+]
+gui = [
+    "streamlit>=1.30",
+    "matplotlib>=3.7",
 ]
 
 [tool.setuptools.packages.find]
