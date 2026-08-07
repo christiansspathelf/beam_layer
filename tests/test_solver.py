@@ -85,3 +85,23 @@ def test_number_of_layer_results(params, concrete, steel):
     forces = SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=10.0, m_yy=0, m_xy=0)
     result = solve(section, forces)
     assert len(result.layers) == n_layers + 2  # concrete sub-layers + 2 reinforcement panels
+
+
+def test_solver_reaches_a_cracked_state(params, concrete, steel):
+    """Regression test: the solver must be able to progress past first
+    cracking, not just stall at the elastic limit. A load-controlled solve
+    of a discretized layered section runs into small but real gaps in the
+    moment-curvature relationship right at each layer's cracking threshold
+    (see shell_layer/solver.py's module docstring) - early versions of the
+    escape-kick mechanism that fixes this either failed to cross the very
+    first one at all, or (a different bug) blew up to unphysical states at
+    higher loads. This exercises the actually-reachable regime.
+    """
+    section = make_section(params, concrete, steel, n_layers=30)
+    forces = SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=40.0, m_yy=0, m_xy=0)
+    result = solve(section, forces)
+
+    concrete_layers = [layer for layer in result.layers if layer.kind == "concrete"]
+    assert any(layer.cracked for layer in concrete_layers)
+    assert all(np.all(np.isfinite(layer.stress)) for layer in result.layers)
+    assert all(abs(v) < 1.0 for layer in concrete_layers for v in layer.strain[:2])  # sane strain magnitude, not blown up

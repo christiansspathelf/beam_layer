@@ -41,27 +41,32 @@ st.caption(
 )
 
 
-def rebar_input(label: str, default_diam: float, default_spacing: float) -> ReinforcementLayout:
+def rebar_input(direction: str, face: str, default_diam: float, default_spacing: float) -> ReinforcementLayout:
+    """direction: 'x' or 'y'. face: 'sup' (top) or 'inf' (bottom)."""
     col1, col2 = st.columns(2)
-    diam = col1.number_input(f"{label} ⌀ [mm]", min_value=6.0, max_value=40.0,
-                              value=default_diam, step=1.0, key=f"{label}_diam")
-    spacing = col2.number_input(f"{label} $s$ [mm]", min_value=50.0, max_value=400.0,
-                                 value=default_spacing, step=10.0, key=f"{label}_spacing")
+    diam = col1.number_input(
+        rf"$\varnothing_{{s{direction},\mathrm{{{face}}}}}$ [mm]",
+        min_value=6.0, max_value=40.0, value=default_diam, step=1.0, key=f"{direction}_{face}_diam",
+    )
+    spacing = col2.number_input(
+        rf"$s_{{{direction},\mathrm{{{face}}}}}$ [mm]",
+        min_value=50.0, max_value=400.0, value=default_spacing, step=10.0, key=f"{direction}_{face}_spacing",
+    )
     return ReinforcementLayout(bar_diameter=diam, spacing=spacing)
 
 
 with st.sidebar:
     st.header("Geometry")
     thickness_mm = st.number_input("$h$ [mm]", min_value=80.0, max_value=1000.0, value=250.0, step=10.0)
-    cover_mm = st.number_input("$c$ [mm]", min_value=10.0, max_value=80.0, value=30.0, step=5.0)
+    cover_mm = st.number_input(r"$c_\mathrm{nom}$ [mm]", min_value=10.0, max_value=80.0, value=30.0, step=5.0)
 
     st.header("Reinforcement")
-    st.caption("Bottom face ($z > 0$)")
-    bottom_x = rebar_input("Bottom $x$", 12.0, 150.0)
-    bottom_y = rebar_input("Bottom $y$", 12.0, 150.0)
-    st.caption("Top face ($z < 0$)")
-    top_x = rebar_input("Top $x$", 12.0, 150.0)
-    top_y = rebar_input("Top $y$", 12.0, 150.0)
+    st.caption(r"Bottom face ($z > 0$, $\mathrm{inf}$)")
+    bottom_x = rebar_input("x", "inf", 12.0, 150.0)
+    bottom_y = rebar_input("y", "inf", 12.0, 150.0)
+    st.caption(r"Top face ($z < 0$, $\mathrm{sup}$)")
+    top_x = rebar_input("x", "sup", 12.0, 150.0)
+    top_y = rebar_input("y", "sup", 12.0, 150.0)
 
     st.header("Concrete")
     fck = st.number_input("$f_{ck}$ [N/mm²]", min_value=12.0, max_value=100.0, value=30.0, step=1.0)
@@ -105,10 +110,12 @@ with st.sidebar:
     run = st.button("Run analysis", type="primary", use_container_width=True)
 
 st.warning(
-    "Load-controlled solving can stall right at the concrete-cracking or "
-    "tension-stiffening-onset transitions (a real snap-through in the "
-    "moment-curvature relationship, not a bug) - if a case doesn't "
-    "converge, try a nearby load level or check the residual below.",
+    "Load levels that leave the section heavily cracked can take a while "
+    "to solve and may land with a non-trivial residual instead of a clean "
+    "convergence (chaining through many small, real jumps in the moment-"
+    "curvature relationship as individual layers crack - not a bug). Check "
+    "the residual and cracked-layer count below rather than assuming "
+    "convergence; more concrete sub-layers usually helps.",
     icon="⚠️",
 )
 
@@ -210,7 +217,7 @@ if "result" in st.session_state:
     st.subheader("Reinforcement panels")
     cols = st.columns(len(rebar_layers))
     for col, layer in zip(cols, rebar_layers):
-        face = "Bottom" if layer.z > 0 else "Top"
+        face = r"Bottom ($\mathrm{inf}$)" if layer.z > 0 else r"Top ($\mathrm{sup}$)"
         with col:
             st.markdown(f"**{face}** ($z$ = {layer.z * 1000:.0f} mm) — {'cracked' if layer.cracked else 'uncracked'}")
             st.latex(
