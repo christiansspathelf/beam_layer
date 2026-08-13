@@ -22,6 +22,7 @@ from shell_layer import (  # noqa: E402
     ShellParameters,
     SteelMaterial,
     solve,
+    trace_path,
 )
 
 KPA_TO_NMM2 = 1e-3  # kN/m^2 -> N/mm^2
@@ -109,6 +110,26 @@ with st.sidebar:
 
     run = st.button("Run analysis", type="primary", use_container_width=True)
 
+    st.header("Moment-curvature curve")
+    st.caption(
+        "Traces the full path via arc-length continuation (not a single "
+        "target solve), so it can follow the response through cracking."
+    )
+    direction_choice = st.selectbox(
+        "Direction", ["Pure $m_{xx}$", "Pure $m_{yy}$", "Current load ratios (above)"],
+    )
+    curve_max_lambda = st.number_input(
+        r"Max $\lambda$ (0 = unbounded, stop only on max steps / ultimate strain)",
+        min_value=0.0, value=0.0, step=10.0,
+    )
+    curve_max_steps = st.slider("Max steps", min_value=5, max_value=60, value=25, step=5)
+    st.caption(
+        "Crossing each crack/yield transition costs a real sub-solve "
+        "(~1-3 s) - a curve that runs deep into cracking can take a "
+        "while. Start with a small step count to explore."
+    )
+    trace = st.button("Trace M-χ curve", use_container_width=True)
+
 st.warning(
     "Load levels that leave the section heavily cracked can take a while "
     "to solve and may land with a non-trivial residual instead of a clean "
@@ -133,6 +154,23 @@ if run:
         result = solve(section, forces)
     st.session_state["result"] = result
     st.session_state["thickness_m"] = params.thickness
+
+if trace:
+    section = LayeredSection(params, concrete, steel, tension_stiffening=tension_stiffening,
+                              n_concrete_layers=n_concrete_layers)
+    if direction_choice == "Pure $m_{xx}$":
+        direction = SectionForces(0, 0, 0, 1.0, 0, 0)
+    elif direction_choice == "Pure $m_{yy}$":
+        direction = SectionForces(0, 0, 0, 0, 1.0, 0)
+    else:
+        norm = float(np.linalg.norm(forces.to_vector())) or 1.0
+        direction = SectionForces(*(forces.to_vector() / norm).tolist())
+    with st.spinner("Tracing moment-curvature path - crossing each crack/yield transition can take a few seconds..."):
+        path = trace_path(section, direction,
+                           max_lambda=curve_max_lambda if curve_max_lambda > 0 else None,
+                           max_steps=curve_max_steps)
+    st.session_state["path"] = path
+    st.session_state["path_thickness_m"] = params.thickness
 
 if "result" in st.session_state:
     result = st.session_state["result"]
@@ -224,5 +262,46 @@ if "result" in st.session_state:
                 r"\sigma_x=%.1f\,\text{N/mm²}\qquad\sigma_y=%.1f\,\text{N/mm²}"
                 % (layer.stress[0] * KPA_TO_NMM2, layer.stress[1] * KPA_TO_NMM2)
             )
-else:
+elif "path" not in st.session_state:
     st.info("Set parameters in the sidebar and click **Run analysis**.")
+
+if "path" in st.session_state:
+    path = st.session_state["path"]
+    n_not_converged = sum(1 for p in path.points if not p.converged)
+
+    st.subheader("Moment-curvature curve")
+    st.caption(
+        f"{len(path.points)} points traced for direction "
+        f"$n_{{xx}}$={path.direction.n_xx:.2f}, $n_{{yy}}$={path.direction.n_yy:.2f}, "
+        f"$n_{{xy}}$={path.direction.n_xy:.2f}, $m_{{xx}}$={path.direction.m_xx:.2f}, "
+        f"$m_{{yy}}$={path.direction.m_yy:.2f}, $m_{{xy}}$={path.direction.m_xy:.2f} "
+        f"(scaled by $\\lambda$)."
+    )
+    if n_not_converged:
+        st.caption(
+            f"{n_not_converged} point(s) are best-effort fallbacks (hollow markers) rather than "
+            "clean corrector convergence - see arclength.py's module docstring."
+        )
+
+    fig2, axes2 = plt.subplots(1, 2, figsize=(9, 4))
+
+    for ax, m_vals, kappa_vals, label_m, label_kappa in (
+        (axes2[0], path.m_xx, path.kappa_x * 1000, r"$m_{xx}$ [kNm/m]", r"$\kappa_x$ [mrad/m]"),
+        (axes2[1], path.m_yy, path.kappa_y * 1000, r"$m_{yy}$ [kNm/m]", r"$\kappa_y$ [mrad/m]"),
+    ):
+        converged_mask = np.array([p.converged for p in path.points])
+        ax.plot(kappa_vals, m_vals, "-", color="black", linewidth=0.8)
+        ax.plot(kappa_vals[converged_mask], m_vals[converged_mask], "o", color="black",
+                markersize=4, label="converged")
+        if np.any(~converged_mask):
+            ax.plot(kappa_vals[~converged_mask], m_vals[~converged_mask], "o", markerfacecolor="none",
+                     markeredgecolor="black", markersize=5, label="best-effort")
+        ax.axhline(0, color="black", linewidth=0.5)
+        ax.axvline(0, color="black", linewidth=0.5)
+        ax.set_xlabel(label_kappa)
+        ax.set_ylabel(label_m)
+        ax.legend(fontsize=7)
+        ax.grid(True, linewidth=0.3)
+
+    fig2.tight_layout()
+    st.pyplot(fig2)

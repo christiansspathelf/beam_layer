@@ -3,6 +3,7 @@ elements, with Kaufmann's Cracked Membrane Model (freely rotating cracks)
 for tension stiffening of the reinforcement.
 """
 
+from .arclength import MomentCurvaturePath, PathPoint, trace_path
 from .geometry import ReinforcementLayout, ShellParameters
 from .loading import SectionForces
 from .materials.concrete import ConcreteMaterial
@@ -12,7 +13,7 @@ from .results import AnalysisResult, LayerResult
 from .section import LayeredSection
 from .solver import solve
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "ConcreteMaterial",
@@ -25,4 +26,7 @@ __all__ = [
     "AnalysisResult",
     "LayerResult",
     "solve",
+    "PathPoint",
+    "MomentCurvaturePath",
+    "trace_path",
 ]

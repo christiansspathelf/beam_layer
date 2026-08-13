@@ -24,7 +24,10 @@ Concrete and reinforcement follow a **nonlinear**, biaxial constitutive model, p
 
 Because cracks rotate freely, shear stress in the principal frame is zero by construction — no separate crack-shear/aggregate-interlock law is needed, unlike a fixed-crack formulation.
 
-**Solver note**: the moment-curvature/force relationship can have a genuine snap-through right at concrete cracking and at tension-stiffening onset (real physical behavior, not a bug — see `shell_layer/solver.py`'s module docstring). The solver uses adaptive incremental load-stepping with a damped, backtracking Newton iteration, which handles this well away from those narrow transition bands; `AnalysisResult.converged` should always be checked rather than assumed.
+**Solver note**: the moment-curvature/force relationship has small but real discontinuities right where individual concrete layers or reinforcement panels cross their cracking threshold (real physical behavior — a discretized layer loses capacity in one finite step, not a bug). Two solvers are available:
+
+- `solve()` — targets a single load vector, using adaptive incremental load-stepping, damped Newton with backtracking, and an escape-kick fallback for the jumps above (see `shell_layer/solver.py`'s module docstring). `AnalysisResult.converged` should always be checked rather than assumed; heavily cracked/high-load targets can land with a non-trivial residual.
+- `trace_path()` — traces the **full** moment-curvature path via arc-length (Crisfield cylindrical) continuation for a chosen loading direction, scaling it by a load factor `lambda` from zero. This is the right tool for getting a complete M-χ curve (including through cracking), rather than solving for one point at a time. See `shell_layer/arclength.py`'s module docstring for the algorithm and its performance characteristics — crossing each cracking transition costs a real sub-solve (~1-3 s), so a curve traced deep into cracking can take real time.
 
 ## Configurable parameters
 
@@ -47,7 +50,8 @@ src/shell_layer/
     layers.py            Concrete sub-layer discretization
     section.py            LayeredSection: forward force/tangent evaluation
     loading.py            SectionForces (n_xx, n_yy, n_xy, m_xx, m_yy, m_xy)
-    solver.py             Nonlinear solve: adaptive load-stepping + damped Newton
+    solver.py             Point-target solve: adaptive load-stepping + damped Newton
+    arclength.py           Full moment-curvature path tracing: arc-length continuation
     results.py            AnalysisResult / LayerResult containers
 gui/
     app.py                Streamlit GUI: parameter input, through-thickness plots
@@ -68,11 +72,12 @@ python -m venv .venv
 ## Status
 
 Core nonlinear layered-section solver, Cracked Membrane Model constitutive
-behavior, and a Streamlit GUI are implemented and tested. Known limitation:
-load levels landing exactly on the cracking / tension-stiffening-onset
-transition can fail to converge (see the solver note above) - this reflects
-a genuine snap-through in the underlying model, not full arc-length
-continuation.
+behavior, arc-length moment-curvature path tracing, and a Streamlit GUI are
+implemented and tested. Known limitation: tracing a curve deep into
+cracking is slow (crossing each layer's cracking threshold costs a real
+sub-solve, see the solver note above) - correct and bounded, but not fast
+enough yet for a "click and wait a second" experience past significant
+cracking.
 
 ## Reference
 

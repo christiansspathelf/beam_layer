@@ -36,7 +36,7 @@ land inside). Three things fixed that:
   Newton direction scaled up (1.5x-12x), then re-solve the same increment's
   target from there. This is what actually lets the solver reach cracked,
   yielded states - verified empirically (see git history) before relying on
-  it. Kicked states are sanity-bounded (`_is_physically_sane`) before being
+  it. Kicked states are sanity-bounded (`is_physically_sane`) before being
   used, since a large multiplier applied near a poorly-conditioned tangent
   can otherwise produce nonsense.
 - **Best-effort acceptance**: if neither a kick nor halving reaches `tol`
@@ -129,7 +129,7 @@ _MAX_STRAIN_MAGNITUDE = 0.05
 _MAX_CURVATURE_MAGNITUDE = 0.5
 
 
-def _is_physically_sane(u: np.ndarray) -> bool:
+def is_physically_sane(u: np.ndarray) -> bool:
     """Reject grossly unphysical states before spending time resolving from
     them - a kick multiplies the Newton direction by up to 12x, and near a
     poorly conditioned tangent (as can happen right at a gap) that direction
@@ -159,11 +159,11 @@ def _try_escape_kick(section: LayeredSection, sub_target: np.ndarray, u_stuck: n
         return best_u, best_res, extra_iterations, False
     for factor in _ESCAPE_KICK_FACTORS:
         u_kicked = u_stuck + factor * d_u
-        if not _is_physically_sane(u_kicked):
+        if not is_physically_sane(u_kicked):
             continue
         u_final, rn, iters, ok, _ = _damped_newton(section, sub_target, u_kicked, tol, _ESCAPE_KICK_MAX_ITER)
         extra_iterations += iters
-        if not _is_physically_sane(u_final):
+        if not is_physically_sane(u_final):
             continue
         if rn < best_res:
             best_u, best_res = u_final, rn
