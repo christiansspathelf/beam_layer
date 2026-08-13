@@ -1,5 +1,5 @@
-"""Streamlit GUI for shell_layer: parameter input and through-thickness
-strain/stress plots for the layered RC shell element.
+"""Streamlit GUI for shell_layer: parameter input, single-load cross-
+sectional analysis, and moment-curvature path tracing.
 
 Run with:
     streamlit run gui/app.py
@@ -21,6 +21,7 @@ from shell_layer import (  # noqa: E402
     SectionForces,
     ShellParameters,
     SteelMaterial,
+    individual_bar_depths,
     solve,
     trace_path,
 )
@@ -54,6 +55,159 @@ def rebar_input(direction: str, face: str, default_diam: float, default_spacing:
         min_value=50.0, max_value=400.0, value=default_spacing, step=10.0, key=f"{direction}_{face}_spacing",
     )
     return ReinforcementLayout(bar_diameter=diam, spacing=spacing)
+
+
+def crack_line_segments(theta1: float, n_lines: int = 7, size: float = 1.0):
+    """Parallel line segments representing cracks at principal-strain angle
+    `theta1` (cracks run perpendicular to the eps1/crack-normal direction),
+    long enough to cross a `size` x `size` square; the caller's fixed
+    axis limits crop them to the square.
+    """
+    phi = theta1 + np.pi / 2.0
+    dx, dy = np.cos(phi), np.sin(phi)
+    nx, ny = -dy, dx
+    length = size * 1.5
+    cx, cy = size / 2.0, size / 2.0
+    segments = []
+    for off in np.linspace(-size * 0.7, size * 0.7, n_lines):
+        px, py = cx + off * nx, cy + off * ny
+        segments.append(((px - dx * length, py - dy * length), (px + dx * length, py + dy * length)))
+    return segments
+
+
+def plan_view_figure(params: ShellParameters, theta_bottom: float, theta_top: float):
+    """Schematic plan view: the bottom-face reinforcement grid (thin grey
+    lines, actual spacing) and the crack pattern implied by the bottom
+    layer's (solid) and top layer's (dotted) principal strain direction.
+    A single, cheap vector drawing - not meant to be a physically exact
+    rendering.
+    """
+    fig, ax = plt.subplots(figsize=(3.6, 3.6))
+    size = 1.0
+    ax.add_patch(plt.Rectangle((0, 0), size, size, fill=False, edgecolor="black", linewidth=1.0))
+
+    sx = max(params.bottom_x.spacing / 1000.0, 1e-3)
+    sy = max(params.bottom_y.spacing / 1000.0, 1e-3)
+    for x in np.arange(sx / 2, size, sx):
+        ax.plot([x, x], [0, size], color="0.75", linewidth=0.6)
+    for y in np.arange(sy / 2, size, sy):
+        ax.plot([0, size], [y, y], color="0.75", linewidth=0.6)
+
+    for (x0, y0), (x1, y1) in crack_line_segments(theta_bottom, size=size):
+        ax.plot([x0, x1], [y0, y1], color="black", linewidth=1.1)
+    for (x0, y0), (x1, y1) in crack_line_segments(theta_top, size=size):
+        ax.plot([x0, x1], [y0, y1], color="black", linewidth=1.1, linestyle=":")
+
+    ax.set_xlim(0, size)
+    ax.set_ylim(0, size)
+    ax.set_aspect("equal")
+    ax.set_xlabel("$x$")
+    ax.set_ylabel("$y$")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    theta_bottom_deg = np.degrees(theta_bottom) % 180
+    theta_top_deg = np.degrees(theta_top) % 180
+    ax.set_title(
+        rf"$\theta_{{r,\mathrm{{inf}}}}$={theta_bottom_deg:.0f}° (—)   "
+        rf"$\theta_{{r,\mathrm{{sup}}}}$={theta_top_deg:.0f}° (····)",
+        fontsize=8,
+    )
+    fig.tight_layout()
+    return fig
+
+
+def cross_section_figure(section: LayeredSection, eps0: np.ndarray, kappa: np.ndarray):
+    """The 5 through-thickness subplots: eps1, eps2, theta_r, principal
+    concrete stress (+ softened peak envelope), and reinforcement stress at
+    each bar's true individual depth - matching the reference figure's
+    layout, notation and grey-fill style.
+    """
+    F, layer_data = section.internal_forces(eps0, kappa)
+    concrete_entries = [(z, state) for kind, z, state in layer_data if kind == "concrete"]
+    bottom_resp = next(state for kind, z, state in layer_data if kind == "reinforcement" and z > 0)
+    top_resp = next(state for kind, z, state in layer_data if kind == "reinforcement" and z < 0)
+
+    z_mm = np.array([z * 1000 for z, _ in concrete_entries])
+    eps1 = np.array([s.eps1 * 1000 for _, s in concrete_entries])
+    eps2 = np.array([s.eps2 * 1000 for _, s in concrete_entries])
+    theta_deg = np.array([np.degrees(s.theta1) % 180 for _, s in concrete_entries])
+    sigma_c1 = np.array([s.sigma1 for _, s in concrete_entries])
+    sigma_c2 = np.array([s.sigma2 for _, s in concrete_entries])
+    f_c = np.array([s.f_c for _, s in concrete_entries])
+
+    h_mm = section.params.thickness * 1000
+    depths = individual_bar_depths(section.params)
+    bar_z_mm = np.array([depths.z_xB, depths.z_yB, depths.z_xT, depths.z_yT]) * 1000
+    bar_sigma = np.array([bottom_resp.sigma_x, bottom_resp.sigma_y, top_resp.sigma_x, top_resp.sigma_y])
+    bar_diam_mm = np.array([
+        section.params.bottom_x.bar_diameter, section.params.bottom_y.bar_diameter,
+        section.params.top_x.bar_diameter, section.params.top_y.bar_diameter,
+    ])
+
+    fig, axes = plt.subplots(1, 5, figsize=(15, 5), sharey=True)
+
+    ax = axes[0]
+    ax.fill_betweenx(z_mm, 0, eps1, color="black", alpha=0.15, linewidth=0)
+    ax.plot(eps1, z_mm, "-", color="black", label=r"$\varepsilon_1$")
+    ax.axvline(0, color="black", linewidth=0.6)
+    ax.set_xlabel(r"$\varepsilon_1$ [‰]")
+    ax.set_ylabel(r"$z$ [mm]")
+    ax.set_title(r"$\varepsilon_1$")
+
+    ax = axes[1]
+    ax.fill_betweenx(z_mm, 0, eps2, color="black", alpha=0.15, linewidth=0)
+    ax.plot(eps2, z_mm, "-", color="black", label=r"$\varepsilon_2$")
+    ax.axvline(0, color="black", linewidth=0.6)
+    ax.set_xlabel(r"$\varepsilon_2$ [‰]")
+    ax.set_title(r"$\varepsilon_2$")
+
+    ax = axes[2]
+    ax.fill_betweenx(z_mm, 0, theta_deg, color="black", alpha=0.15, linewidth=0)
+    ax.plot(theta_deg, z_mm, "-", color="black")
+    ax.set_xlim(0, 180)
+    ax.set_xticks([0, 90, 180])
+    ax.set_xlabel(r"$\theta_r$ [°]")
+    ax.set_title(r"$\theta_r$")
+
+    ax = axes[3]
+    ax.fill_betweenx(z_mm, 0, sigma_c2, color="0.5", alpha=0.35, linewidth=0)
+    ax.plot(sigma_c2, z_mm, "-", color="black", label=r"$\sigma_{c2r}$")
+    ax.plot(sigma_c1, z_mm, "-", color="0.55", label=r"$\sigma_{c1r}$")
+    ax.plot(-f_c, z_mm, "-.", color="black", linewidth=0.8, label=r"$f_c$")
+    ax.axvline(0, color="black", linewidth=0.6)
+    ax.set_xlabel(r"$\sigma_{cr}$ [N/mm²]")
+    ax.legend(fontsize=7, loc="lower left")
+    ax.set_title(r"$\sigma_{c1r},\ \sigma_{c2r}$")
+
+    ax = axes[4]
+    ax.barh(bar_z_mm, bar_sigma, height=np.maximum(bar_diam_mm, 4.0), color="0.75",
+            edgecolor="black", linewidth=0.6)
+    # Fix the x-range from the bar data alone (padded) *before* drawing the
+    # fy reference lines - axvline would otherwise stretch the autoscale out
+    # to +-fy even when actual stresses are a small fraction of yield,
+    # making the bars themselves nearly invisible for lightly-loaded cases.
+    data_max = max(float(np.max(np.abs(bar_sigma))), 1.0) * 1.6
+    ax.set_xlim(-data_max, data_max)
+    ax.axvline(0, color="black", linewidth=0.6)
+    if data_max > section.steel.fy * 0.5:
+        ax.axvline(section.steel.fy, color="0.4", linewidth=0.7, linestyle="--", label=r"$f_{sy}$")
+        ax.axvline(-section.steel.fy, color="0.4", linewidth=0.7, linestyle="--")
+    for z, sigma, label in zip(bar_z_mm, bar_sigma, ["$x,\\mathrm{inf}$", "$y,\\mathrm{inf}$",
+                                                      "$x,\\mathrm{sup}$", "$y,\\mathrm{sup}$"]):
+        ax.annotate(label, (sigma, z), textcoords="offset points",
+                    xytext=(6 if sigma >= 0 else -6, 0),
+                    ha="left" if sigma >= 0 else "right", va="center", fontsize=6)
+    ax.set_xlabel(r"$\sigma_{sr}$ [N/mm²]")
+    if data_max > section.steel.fy * 0.5:
+        ax.legend(fontsize=7, loc="lower right")
+    ax.set_title(r"$\sigma_{sr}$")
+
+    for ax in axes:
+        ax.set_ylim(h_mm / 2, -h_mm / 2)  # z positive downward: top of plot = top face
+        ax.grid(True, linewidth=0.3)
+
+    fig.tight_layout()
+    return fig
 
 
 with st.sidebar:
@@ -96,212 +250,160 @@ with st.sidebar:
     tension_stiffening = st.checkbox("Tension stiffening (Kaufmann TCM)", value=True)
     n_concrete_layers = st.slider("Concrete sub-layers", min_value=8, max_value=100, value=30, step=2)
 
-    st.header("Sectional loading")
-    st.caption("Membrane forces [kN/m]")
-    c1, c2, c3 = st.columns(3)
-    n_xx = c1.number_input("$n_{xx}$", value=0.0, step=10.0)
-    n_yy = c2.number_input("$n_{yy}$", value=0.0, step=10.0)
-    n_xy = c3.number_input("$n_{xy}$", value=0.0, step=10.0)
-    st.caption("Bending / twisting moments [kNm/m]")
-    c4, c5, c6 = st.columns(3)
-    m_xx = c4.number_input("$m_{xx}$", value=10.0, step=5.0)
-    m_yy = c5.number_input("$m_{yy}$", value=0.0, step=5.0)
-    m_xy = c6.number_input("$m_{xy}$", value=0.0, step=5.0)
-
-    run = st.button("Run analysis", type="primary", use_container_width=True)
-
-    st.header("Moment-curvature curve")
+    st.header("Loading direction")
     st.caption(
-        "Traces the full path via arc-length continuation (not a single "
-        "target solve), so it can follow the response through cracking."
+        r"Unit distribution $m_i=[n_{xx},n_{yy},n_{xy},m_{xx},m_{yy},m_{xy}]$, "
+        r"scaled by $\kappa$ in each tab below."
     )
-    direction_choice = st.selectbox(
-        "Direction", ["Pure $m_{xx}$", "Pure $m_{yy}$", "Current load ratios (above)"],
-    )
-    curve_max_lambda = st.number_input(
-        r"Max $\lambda$ (0 = unbounded, stop only on max steps / ultimate strain)",
-        min_value=0.0, value=0.0, step=10.0,
-    )
-    curve_max_steps = st.slider("Max steps", min_value=5, max_value=60, value=25, step=5)
-    st.caption(
-        "Crossing each crack/yield transition costs a real sub-solve "
-        "(~1-3 s) - a curve that runs deep into cracking can take a "
-        "while. Start with a small step count to explore."
-    )
-    trace = st.button("Trace M-χ curve", use_container_width=True)
-
-st.warning(
-    "Load levels that leave the section heavily cracked can take a while "
-    "to solve and may land with a non-trivial residual instead of a clean "
-    "convergence (chaining through many small, real jumps in the moment-"
-    "curvature relationship as individual layers crack - not a bug). Check "
-    "the residual and cracked-layer count below rather than assuming "
-    "convergence; more concrete sub-layers usually helps.",
-    icon="⚠️",
-)
+    d1, d2, d3 = st.columns(3)
+    dir_n_xx = d1.number_input("$n_{xx}$", value=0.0, step=0.1)
+    dir_n_yy = d2.number_input("$n_{yy}$", value=0.0, step=0.1)
+    dir_n_xy = d3.number_input("$n_{xy}$", value=0.0, step=0.1)
+    d4, d5, d6 = st.columns(3)
+    dir_m_xx = d4.number_input("$m_{xx}$", value=1.0, step=0.1)
+    dir_m_yy = d5.number_input("$m_{yy}$", value=0.0, step=0.1)
+    dir_m_xy = d6.number_input("$m_{xy}$", value=0.0, step=0.1)
 
 params = ShellParameters(
     thickness=thickness_mm / 1000.0,
     cover=cover_mm / 1000.0,
     top_x=top_x, top_y=top_y, bottom_x=bottom_x, bottom_y=bottom_y,
 )
-forces = SectionForces(n_xx=n_xx, n_yy=n_yy, n_xy=n_xy, m_xx=m_xx, m_yy=m_yy, m_xy=m_xy)
+direction = SectionForces(dir_n_xx, dir_n_yy, dir_n_xy, dir_m_xx, dir_m_yy, dir_m_xy)
+direction_norm = float(np.linalg.norm(direction.to_vector()))
 
-if run:
-    section = LayeredSection(params, concrete, steel, tension_stiffening=tension_stiffening,
-                              n_concrete_layers=n_concrete_layers)
-    with st.spinner("Solving..."):
-        result = solve(section, forces)
-    st.session_state["result"] = result
-    st.session_state["thickness_m"] = params.thickness
+tab_single, tab_curve = st.tabs(["Single load analysis", "Complete load-deformation curve"])
 
-if trace:
-    section = LayeredSection(params, concrete, steel, tension_stiffening=tension_stiffening,
-                              n_concrete_layers=n_concrete_layers)
-    if direction_choice == "Pure $m_{xx}$":
-        direction = SectionForces(0, 0, 0, 1.0, 0, 0)
-    elif direction_choice == "Pure $m_{yy}$":
-        direction = SectionForces(0, 0, 0, 0, 1.0, 0)
+with tab_single:
+    if direction_norm == 0:
+        st.error("Set a nonzero loading direction in the sidebar.")
     else:
-        norm = float(np.linalg.norm(forces.to_vector())) or 1.0
-        direction = SectionForces(*(forces.to_vector() / norm).tolist())
-    with st.spinner("Tracing moment-curvature path - crossing each crack/yield transition can take a few seconds..."):
-        path = trace_path(section, direction,
-                           max_lambda=curve_max_lambda if curve_max_lambda > 0 else None,
-                           max_steps=curve_max_steps)
-    st.session_state["path"] = path
-    st.session_state["path_thickness_m"] = params.thickness
+        kappa_scale = st.number_input(
+            r"$\kappa$ (scales the unit distribution: load = $\kappa \times$ direction) "
+            "[kN/m or kNm/m]",
+            value=10.0, step=5.0,
+        )
+        run = st.button("Run analysis", type="primary")
 
-if "result" in st.session_state:
-    result = st.session_state["result"]
-    h = st.session_state["thickness_m"]
+        if run:
+            section = LayeredSection(params, concrete, steel, tension_stiffening=tension_stiffening,
+                                      n_concrete_layers=n_concrete_layers)
+            forces_vec = kappa_scale * direction.to_vector()
+            forces = SectionForces(*forces_vec.tolist())
+            with st.spinner("Solving..."):
+                result = solve(section, forces)
+            st.session_state["result"] = result
+            st.session_state["section_for_result"] = section
 
-    if result.converged:
-        st.success(f"Converged in {result.iterations} evaluations (residual = {result.residual_norm:.2e})")
+        if "result" in st.session_state:
+            result = st.session_state["result"]
+            section = st.session_state["section_for_result"]
+
+            if result.converged:
+                st.success(f"Converged in {result.iterations} evaluations (residual = {result.residual_norm:.2e})")
+            else:
+                st.error(f"Not converged after {result.iterations} evaluations (residual = {result.residual_norm:.3f})")
+
+            res_col1, res_col2 = st.columns(2)
+            with res_col1:
+                st.latex(
+                    r"\varepsilon_{x,0}=%.4f\,\text{‰}\qquad"
+                    r"\varepsilon_{y,0}=%.4f\,\text{‰}\qquad"
+                    r"\gamma_{xy,0}=%.4f\,\text{‰}"
+                    % tuple(v * 1000 for v in result.eps0)
+                )
+            with res_col2:
+                st.latex(
+                    r"\kappa_{x}=%.4f\,\text{mrad/m}\qquad"
+                    r"\kappa_{y}=%.4f\,\text{mrad/m}\qquad"
+                    r"\kappa_{xy}=%.4f\,\text{mrad/m}"
+                    % tuple(v * 1000 for v in result.kappa)
+                )
+
+            _, layer_data = section.internal_forces(result.eps0, result.kappa)
+            concrete_entries = [(z, s) for kind, z, s in layer_data if kind == "concrete"]
+            theta_top = concrete_entries[0][1].theta1
+            theta_bottom = concrete_entries[-1][1].theta1
+
+            plan_col, _ = st.columns([1, 2])
+            with plan_col:
+                st.pyplot(plan_view_figure(params, theta_bottom, theta_top))
+
+            st.pyplot(cross_section_figure(section, result.eps0, result.kappa))
+        else:
+            st.info("Set $\\kappa$ and click **Run analysis**.")
+
+with tab_curve:
+    if direction_norm == 0:
+        st.error("Set a nonzero loading direction in the sidebar.")
     else:
-        st.error(f"Not converged after {result.iterations} evaluations (residual = {result.residual_norm:.3f})")
-
-    res_col1, res_col2 = st.columns(2)
-    with res_col1:
-        st.latex(
-            r"\varepsilon_{x,0}=%.4f\,\text{‰}\qquad"
-            r"\varepsilon_{y,0}=%.4f\,\text{‰}\qquad"
-            r"\gamma_{xy,0}=%.4f\,\text{‰}"
-            % tuple(v * 1000 for v in result.eps0)
-        )
-    with res_col2:
-        st.latex(
-            r"\kappa_{x}=%.4f\,\text{mrad/m}\qquad"
-            r"\kappa_{y}=%.4f\,\text{mrad/m}\qquad"
-            r"\kappa_{xy}=%.4f\,\text{mrad/m}"
-            % tuple(v * 1000 for v in result.kappa)
-        )
-
-    concrete_layers = [l for l in result.layers if l.kind == "concrete"]
-    rebar_layers = [l for l in result.layers if l.kind == "reinforcement"]
-
-    z_c = np.array([l.z * 1000 for l in concrete_layers])  # mm, for readability
-    eps1 = np.array([l.strain[0] * 1000 for l in concrete_layers])  # permille
-    eps2 = np.array([l.strain[1] * 1000 for l in concrete_layers])  # permille
-    sig_x = np.array([l.stress[0] for l in concrete_layers]) * KPA_TO_NMM2
-    sig_y = np.array([l.stress[1] for l in concrete_layers]) * KPA_TO_NMM2
-    cracked = np.array([l.cracked for l in concrete_layers])
-    theta = np.array([np.degrees(l.theta) if l.theta is not None else np.nan for l in concrete_layers])
-
-    fig, axes = plt.subplots(1, 4, figsize=(13, 5), sharey=True)
-    h_mm = h * 1000
-
-    ax = axes[0]
-    ax.fill_betweenx(z_c, 0, eps1, color="black", alpha=0.15, linewidth=0)
-    ax.fill_betweenx(z_c, 0, eps2, color="0.6", alpha=0.25, linewidth=0)
-    ax.plot(eps1, z_c, "-", color="black", label=r"$\varepsilon_1$")
-    ax.plot(eps2, z_c, "-", color="0.6", label=r"$\varepsilon_2$")
-    ax.axvline(0, color="black", linewidth=0.6)
-    ax.set_xlabel(r"$\varepsilon$ [‰]")
-    ax.set_ylabel(r"$z$ [mm]")
-    ax.legend(fontsize=8)
-    ax.set_title("Principal strain")
-
-    ax = axes[1]
-    ax.fill_betweenx(z_c, 0, sig_x, color="black", alpha=0.15, linewidth=0)
-    ax.fill_betweenx(z_c, 0, sig_y, color="0.6", alpha=0.25, linewidth=0)
-    ax.plot(sig_x, z_c, "-", color="black", label=r"$\sigma_x$")
-    ax.plot(sig_y, z_c, "-", color="0.6", label=r"$\sigma_y$")
-    ax.axvline(0, color="black", linewidth=0.6)
-    ax.set_xlabel(r"$\sigma$ [N/mm²]")
-    ax.legend(fontsize=8)
-    ax.set_title("Concrete stress")
-
-    ax = axes[2]
-    ax.fill_betweenx(z_c, 0, theta, color="black", alpha=0.15, linewidth=0)
-    ax.plot(theta, z_c, "-", color="black", label=r"$\theta_r$")
-    ax.axvline(0, color="black", linewidth=0.6)
-    ax.set_xlabel(r"$\theta_r$ [°]")
-    ax.set_title("Crack orientation")
-
-    ax = axes[3]
-    ax.fill_betweenx(z_c, 0, 1, where=cracked, color="0.85", step="mid", label="cracked")
-    ax.set_xlim(0, 1)
-    ax.set_xticks([])
-    ax.set_title("Cracked?")
-    ax.legend(fontsize=8, loc="upper right")
-
-    for ax in axes:
-        ax.set_ylim(h_mm / 2, -h_mm / 2)  # z positive downward: top of plot = top face
-        ax.grid(True, linewidth=0.3)
-
-    st.pyplot(fig)
-
-    st.subheader("Reinforcement panels")
-    cols = st.columns(len(rebar_layers))
-    for col, layer in zip(cols, rebar_layers):
-        face = r"Bottom ($\mathrm{inf}$)" if layer.z > 0 else r"Top ($\mathrm{sup}$)"
-        with col:
-            st.markdown(f"**{face}** ($z$ = {layer.z * 1000:.0f} mm) — {'cracked' if layer.cracked else 'uncracked'}")
-            st.latex(
-                r"\sigma_x=%.1f\,\text{N/mm²}\qquad\sigma_y=%.1f\,\text{N/mm²}"
-                % (layer.stress[0] * KPA_TO_NMM2, layer.stress[1] * KPA_TO_NMM2)
-            )
-elif "path" not in st.session_state:
-    st.info("Set parameters in the sidebar and click **Run analysis**.")
-
-if "path" in st.session_state:
-    path = st.session_state["path"]
-    n_not_converged = sum(1 for p in path.points if not p.converged)
-
-    st.subheader("Moment-curvature curve")
-    st.caption(
-        f"{len(path.points)} points traced for direction "
-        f"$n_{{xx}}$={path.direction.n_xx:.2f}, $n_{{yy}}$={path.direction.n_yy:.2f}, "
-        f"$n_{{xy}}$={path.direction.n_xy:.2f}, $m_{{xx}}$={path.direction.m_xx:.2f}, "
-        f"$m_{{yy}}$={path.direction.m_yy:.2f}, $m_{{xy}}$={path.direction.m_xy:.2f} "
-        f"(scaled by $\\lambda$)."
-    )
-    if n_not_converged:
         st.caption(
-            f"{n_not_converged} point(s) are best-effort fallbacks (hollow markers) rather than "
-            "clean corrector convergence - see arclength.py's module docstring."
+            "Traces the full path via arc-length continuation (not a single "
+            "target solve), so it can follow the response through cracking."
         )
+        curve_max_lambda = st.number_input(
+            r"Max $\kappa$ (0 = unbounded, stop only on max steps / ultimate strain)",
+            min_value=0.0, value=0.0, step=10.0,
+        )
+        curve_max_steps = st.slider("Max steps (adaptive spacing in $\\kappa$, capped here)",
+                                     min_value=5, max_value=60, value=25, step=5)
+        st.caption(
+            "Crossing each crack/yield transition costs a real sub-solve "
+            "(~1-3 s) - a curve that runs deep into cracking can take a "
+            "while. Start with a small step count to explore."
+        )
+        trace = st.button("Trace M-χ curve", type="primary")
 
-    fig2, axes2 = plt.subplots(1, 2, figsize=(9, 4))
+        if trace:
+            section = LayeredSection(params, concrete, steel, tension_stiffening=tension_stiffening,
+                                      n_concrete_layers=n_concrete_layers)
+            with st.spinner(
+                "Tracing moment-curvature path - crossing each crack/yield transition can take a few seconds..."
+            ):
+                path = trace_path(section, direction,
+                                   max_lambda=curve_max_lambda if curve_max_lambda > 0 else None,
+                                   max_steps=curve_max_steps)
+            st.session_state["path"] = path
 
-    for ax, m_vals, kappa_vals, label_m, label_kappa in (
-        (axes2[0], path.m_xx, path.kappa_x * 1000, r"$m_{xx}$ [kNm/m]", r"$\kappa_x$ [mrad/m]"),
-        (axes2[1], path.m_yy, path.kappa_y * 1000, r"$m_{yy}$ [kNm/m]", r"$\kappa_y$ [mrad/m]"),
-    ):
-        converged_mask = np.array([p.converged for p in path.points])
-        ax.plot(kappa_vals, m_vals, "-", color="black", linewidth=0.8)
-        ax.plot(kappa_vals[converged_mask], m_vals[converged_mask], "o", color="black",
-                markersize=4, label="converged")
-        if np.any(~converged_mask):
-            ax.plot(kappa_vals[~converged_mask], m_vals[~converged_mask], "o", markerfacecolor="none",
-                     markeredgecolor="black", markersize=5, label="best-effort")
-        ax.axhline(0, color="black", linewidth=0.5)
-        ax.axvline(0, color="black", linewidth=0.5)
-        ax.set_xlabel(label_kappa)
-        ax.set_ylabel(label_m)
-        ax.legend(fontsize=7)
-        ax.grid(True, linewidth=0.3)
+        if "path" in st.session_state:
+            path = st.session_state["path"]
+            n_not_converged = sum(1 for p in path.points if not p.converged)
 
-    fig2.tight_layout()
-    st.pyplot(fig2)
+            st.caption(
+                f"{len(path.points)} points traced for direction "
+                f"$n_{{xx}}$={path.direction.n_xx:.2f}, $n_{{yy}}$={path.direction.n_yy:.2f}, "
+                f"$n_{{xy}}$={path.direction.n_xy:.2f}, $m_{{xx}}$={path.direction.m_xx:.2f}, "
+                f"$m_{{yy}}$={path.direction.m_yy:.2f}, $m_{{xy}}$={path.direction.m_xy:.2f} "
+                f"(scaled by $\\kappa$)."
+            )
+            if n_not_converged:
+                st.caption(
+                    f"{n_not_converged} point(s) are best-effort fallbacks (hollow markers) rather than "
+                    "clean corrector convergence - see arclength.py's module docstring."
+                )
+
+            fig2, axes2 = plt.subplots(1, 3, figsize=(13, 4))
+            converged_mask = np.array([p.converged for p in path.points])
+
+            for ax, m_vals, kappa_vals, label_m, label_kappa in (
+                (axes2[0], path.m_xx, path.kappa_x * 1000, r"$m_{xx}$ [kNm/m]", r"$\kappa_x$ [mrad/m]"),
+                (axes2[1], path.m_yy, path.kappa_y * 1000, r"$m_{yy}$ [kNm/m]", r"$\kappa_y$ [mrad/m]"),
+                (axes2[2], path.m_xy, path.kappa_xy * 1000, r"$m_{xy}$ [kNm/m]", r"$\kappa_{xy}$ [mrad/m]"),
+            ):
+                ax.plot(kappa_vals, m_vals, "-", color="black", linewidth=0.8)
+                ax.plot(kappa_vals[converged_mask], m_vals[converged_mask], "o", color="black",
+                        markersize=4, label="converged")
+                if np.any(~converged_mask):
+                    ax.plot(kappa_vals[~converged_mask], m_vals[~converged_mask], "o", markerfacecolor="none",
+                             markeredgecolor="black", markersize=5, label="best-effort")
+                ax.axhline(0, color="black", linewidth=0.5)
+                ax.axvline(0, color="black", linewidth=0.5)
+                ax.set_xlabel(label_kappa)
+                ax.set_ylabel(label_m)
+                ax.legend(fontsize=7)
+                ax.grid(True, linewidth=0.3)
+
+            fig2.tight_layout()
+            st.pyplot(fig2)
+        else:
+            st.info("Set the max $\\kappa$/steps and click **Trace M-χ curve**.")

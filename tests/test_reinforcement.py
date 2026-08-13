@@ -3,7 +3,7 @@ import math
 import pytest
 
 from shell_layer import ReinforcementLayout, ShellParameters
-from shell_layer.reinforcement import build_reinforcement_panels, crack_spacing
+from shell_layer.reinforcement import build_reinforcement_panels, crack_spacing, individual_bar_depths
 
 
 @pytest.fixture
@@ -39,3 +39,14 @@ def test_crack_spacing_combines_at_intermediate_angle():
     s = crack_spacing(100.0, 200.0, math.pi / 4)
     expected = 1.0 / (math.cos(math.pi / 4) / 100.0 + math.sin(math.pi / 4) / 200.0)
     assert s == pytest.approx(expected)
+
+
+def test_individual_bar_depths_nested_x_outer_y_inner(params):
+    """x-direction bars are the outer layer on each face, y nested inside -
+    so |z_xB| > |z_yB| (x closer to the bottom face) and |z_xT| > |z_yT|
+    (x closer to the top face)."""
+    depths = individual_bar_depths(params)
+    assert depths.z_xB > depths.z_yB > 0  # bottom: x outermost (largest z), both positive
+    assert depths.z_xT < depths.z_yT < 0  # top: x outermost (most negative z), both negative
+    assert depths.z_xB == pytest.approx(params.thickness / 2 - params.cover - 0.006)
+    assert depths.z_yB == pytest.approx(params.thickness / 2 - params.cover - 0.012 - 0.006)

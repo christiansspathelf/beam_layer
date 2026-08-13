@@ -53,6 +53,33 @@ def build_reinforcement_panels(params: ShellParameters) -> Tuple[ReinforcementPa
     return bottom, top
 
 
+@dataclass(frozen=True)
+class BarDepths:
+    """True individual bar centroid depths [m], positive downward - distinct
+    from `ReinforcementPanel.z` (the single smeared depth the solver uses
+    for both bars on a face). For display only: plotting a bar's stress at
+    its own real depth rather than the shared panel depth matches how the
+    reference model's own plots present it (x-direction bars are the outer,
+    y-direction the nested inner layer on each face, matching
+    ReinforcementParameters.m's z_xB/z_yB/z_xT/z_yT).
+    """
+
+    z_xB: float
+    z_yB: float
+    z_xT: float
+    z_yT: float
+
+
+def individual_bar_depths(params: ShellParameters) -> BarDepths:
+    h = params.thickness
+    c = params.cover
+    z_xB = h / 2 - c - params.bottom_x.bar_diameter / 2000.0
+    z_yB = h / 2 - c - params.bottom_x.bar_diameter / 1000.0 - params.bottom_y.bar_diameter / 2000.0
+    z_xT = -(h / 2 - c - params.top_x.bar_diameter / 2000.0)
+    z_yT = -(h / 2 - c - params.top_x.bar_diameter / 1000.0 - params.top_y.bar_diameter / 2000.0)
+    return BarDepths(z_xB=z_xB, z_yB=z_yB, z_xT=z_xT, z_yT=z_yT)
+
+
 def crack_spacing(s_rmx0: float, s_rmy0: float, theta1: float) -> float:
     """Combine direction-specific crack spacings at crack angle theta1
     (angle from the x-axis to the eps1/crack-normal direction), per

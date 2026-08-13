@@ -8,7 +8,7 @@ from .geometry import ReinforcementLayout, ShellParameters
 from .loading import SectionForces
 from .materials.concrete import ConcreteMaterial
 from .materials.steel import SteelMaterial
-from .reinforcement import ReinforcementPanel
+from .reinforcement import BarDepths, ReinforcementPanel, individual_bar_depths
 from .results import AnalysisResult, LayerResult
 from .section import LayeredSection
 from .solver import solve
@@ -20,6 +20,8 @@ __all__ = [
     "SteelMaterial",
     "ReinforcementLayout",
     "ReinforcementPanel",
+    "BarDepths",
+    "individual_bar_depths",
     "ShellParameters",
     "LayeredSection",
     "SectionForces",
