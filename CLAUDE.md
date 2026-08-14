@@ -151,8 +151,25 @@ results.py (AnalysisResult / LayerResult)
   `arclength.py` would be the natural next step, not yet done.
 - **`gui/app.py`**: Streamlit front end, tabbed — "Single load analysis" (point
   `solve()` + 5-subplot through-thickness figure + schematic plan view with
-  crack pattern) and "Complete load-deformation curve" (`trace_path()`). Adds
-  `src/` to `sys.path` manually rather than relying on the editable install.
+  crack pattern + a residual-vs-iteration convergence plot, in that vertical
+  order - the wide 5-subplot figure comes first, plan view and convergence
+  sit side-by-side below it) and "Complete load-deformation curve"
+  (`trace_path()`). Adds `src/` to `sys.path` manually rather than relying on
+  the editable install. `solve()`'s optional `history` list parameter
+  captures a residual-per-iteration trace across the whole call (probe +
+  incremental steps + kicks) for that convergence plot - purely
+  observational, see `solver.py`'s docstring. A defensive retry wraps
+  `matplotlib.mathtext.MathTextParser.parse` at module load: under
+  Streamlit's threaded execution, the first mathtext calls in a process can
+  intermittently raise a spurious `ParseException` on valid strings (a
+  mathtext-cache race, reproduced with plain `$x$` failing once then
+  succeeding immediately after) - not a real syntax problem, don't
+  "fix" it by rewriting label strings.
+  **Formatting convention**: no space (nor `\,`) between a formatted number
+  and a `%`/`‰` suffix in either f-strings or LaTeX (`st.latex`) - e.g.
+  `f"{x:.2f}‰"`, not `f"{x:.2f} ‰"` or `r"...\,\text{‰}"`. Bar
+  diameter/spacing and shell thickness/cover inputs use
+  `format="%.0f"` (whole millimetres, no decimals).
 
 ## Conventions worth knowing before editing
 

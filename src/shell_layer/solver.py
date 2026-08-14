@@ -99,7 +99,8 @@ _STAGNATION_REL_IMPROVEMENT = 0.02  # give up early if <2% improvement over the 
 
 
 def _damped_newton(section: LayeredSection, target: np.ndarray, u0: np.ndarray,
-                    tol: float, max_iter: int, tangent_fn: Optional[TangentFn] = None):
+                    tol: float, max_iter: int, tangent_fn: Optional[TangentFn] = None,
+                    history: Optional[List[float]] = None):
     """Fixed-target damped Newton solve. Returns (u, residual_norm, iterations, converged, last_d_u).
 
     Gives up early (before `max_iter`) if the residual stalls: once a run is
@@ -114,6 +115,13 @@ def _damped_newton(section: LayeredSection, target: np.ndarray, u0: np.ndarray,
     tangent_complex_step` (see module docstring). Pass
     `lambda sec, e, k: sec.tangent(e, k)` to fall back to the older central
     finite difference, e.g. for comparison.
+
+    `history`, if given, has each iteration's `residual_norm` appended to it
+    in call order - purely observational (e.g. for plotting a convergence
+    trace), no effect on the solve itself. A caller stitching together
+    several `_damped_newton` calls (as `solve` does: probe, incremental
+    steps, kicks) can pass the same list throughout to get one continuous
+    trace, including the jumps where a kick restarts from a new state.
     """
     tangent_fn = tangent_fn or tangent_complex_step
     u = u0.copy()
@@ -125,6 +133,8 @@ def _damped_newton(section: LayeredSection, target: np.ndarray, u0: np.ndarray,
         F, _ = section.internal_forces(eps0, kappa)
         residual = target - F
         residual_norm = float(np.linalg.norm(residual))
+        if history is not None:
+            history.append(residual_norm)
         if residual_norm <= tol:
             return u, residual_norm, iterations, True, last_d_u
 
@@ -191,7 +201,8 @@ def is_physically_sane(u: np.ndarray) -> bool:
 
 
 def _try_escape_kick(section: LayeredSection, sub_target: np.ndarray, u_stuck: np.ndarray,
-                      d_u: np.ndarray, tol: float, tangent_fn: Optional[TangentFn] = None):
+                      d_u: np.ndarray, tol: float, tangent_fn: Optional[TangentFn] = None,
+                      history: Optional[List[float]] = None):
     """When stuck right at a discretization gap, incremental backtracked steps
     keep landing just short of it (the whole point of backtracking is to
     require improvement, which is exactly what's impossible from inside the
@@ -211,7 +222,7 @@ def _try_escape_kick(section: LayeredSection, sub_target: np.ndarray, u_stuck: n
         if not is_physically_sane(u_kicked):
             continue
         u_final, rn, iters, ok, _ = _damped_newton(section, sub_target, u_kicked, tol,
-                                                    _ESCAPE_KICK_MAX_ITER, tangent_fn)
+                                                    _ESCAPE_KICK_MAX_ITER, tangent_fn, history)
         extra_iterations += iters
         if not is_physically_sane(u_final):
             continue
@@ -253,6 +264,7 @@ def solve(
     total_iteration_budget: int = 20_000,
     direct_probe: bool = True,
     tangent_fn: Optional[TangentFn] = None,
+    history: Optional[List[float]] = None,
 ) -> AnalysisResult:
     """Solve for the mid-surface strain/curvature state matching `forces`.
 
@@ -294,6 +306,10 @@ def solve(
     `tangent_fn` overrides how every internal Newton solve (direct probe,
     incremental steps, escape kicks) computes its tangent stiffness;
     defaults to `complex_step.tangent_complex_step` (see module docstring).
+
+    `history`, if given (e.g. `[]`), has every internal Newton iteration's
+    `residual_norm` appended to it in call order - see `_damped_newton`'s
+    docstring. Purely observational; does not affect the solve.
     """
     target = forces.to_vector()
     u_start = np.array(_DEFAULT_INITIAL_GUESS if initial_guess is None else initial_guess, dtype=float)
@@ -302,7 +318,7 @@ def solve(
     if direct_probe:
         probe_max_iter = min(max_iter, _DIRECT_PROBE_MAX_ITER)
         u_direct, direct_res, direct_iters, direct_ok, _ = _damped_newton(
-            section, target, u_start, tol, probe_max_iter, tangent_fn)
+            section, target, u_start, tol, probe_max_iter, tangent_fn, history)
         total_iterations += direct_iters
         if direct_ok:
             eps0, kappa = u_direct[:3], u_direct[3:]
@@ -321,7 +337,7 @@ def solve(
         sub_target = target * next_frac
 
         u_trial, step_residual_norm, iters, ok, d_u = _damped_newton(
-            section, sub_target, u, tol, max_iter, tangent_fn)
+            section, sub_target, u, tol, max_iter, tangent_fn, history)
         total_iterations += iters
 
         if ok:
@@ -337,7 +353,7 @@ def solve(
             # only fall back to halving if the kick can't beat what halving
             # would find anyway.
             u_kicked, kicked_res, kick_iters, kicked_ok = _try_escape_kick(
-                section, sub_target, u_trial, d_u, tol, tangent_fn)
+                section, sub_target, u_trial, d_u, tol, tangent_fn, history)
             total_iterations += kick_iters
             if kicked_ok or kicked_res < step_residual_norm:
                 u = u_kicked

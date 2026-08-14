@@ -6,6 +6,7 @@ Run with:
 """
 
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -34,12 +35,35 @@ plt.rcParams.update({
     "font.size": 9,
 })
 
+# Defensive retry around matplotlib's mathtext parser: under Streamlit's
+# threaded script execution, the first mathtext calls in a process
+# intermittently raise a ParseException on otherwise-valid strings (a
+# matplotlib mathtext-cache race, not a syntax problem - reproduced with
+# plain "$x$" failing once and succeeding immediately after). Retrying a
+# few times absorbs it without changing the font/rendering style.
+import matplotlib.mathtext as _mathtext  # noqa: E402
+
+_orig_mathtext_parse = _mathtext.MathTextParser.parse
+
+
+def _retrying_mathtext_parse(self, s, *args, **kwargs):
+    last_exc = None
+    for _ in range(5):
+        try:
+            return _orig_mathtext_parse(self, s, *args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc
+
+
+_mathtext.MathTextParser.parse = _retrying_mathtext_parse
+
 st.set_page_config(page_title="shell_layer", layout="wide")
+st.markdown("<style>.block-container{padding-top:1.5rem;}</style>", unsafe_allow_html=True)
 st.title("Layered RC shell element analysis")
 st.caption(
-    "Kaufmann's Cracked Membrane Model (Tension Chord Model tension "
-    r"stiffening) with freely rotating cracks. $z$ is positive downward: "
-    r"top face at $z=-h/2$, bottom face at $z=+h/2$."
+    "Analysis of reinforced concrete shell elements in a layered "
+    "formulation including the effects of tension stiffening."
 )
 
 
@@ -48,11 +72,13 @@ def rebar_input(direction: str, face: str, default_diam: float, default_spacing:
     col1, col2 = st.columns(2)
     diam = col1.number_input(
         rf"$\varnothing_{{s{direction},\mathrm{{{face}}}}}$ [mm]",
-        min_value=6.0, max_value=40.0, value=default_diam, step=1.0, key=f"{direction}_{face}_diam",
+        min_value=6.0, max_value=40.0, value=default_diam, step=1.0, format="%.0f",
+        key=f"{direction}_{face}_diam",
     )
     spacing = col2.number_input(
         rf"$s_{{{direction},\mathrm{{{face}}}}}$ [mm]",
-        min_value=50.0, max_value=400.0, value=default_spacing, step=10.0, key=f"{direction}_{face}_spacing",
+        min_value=50.0, max_value=400.0, value=default_spacing, step=10.0, format="%.0f",
+        key=f"{direction}_{face}_spacing",
     )
     return ReinforcementLayout(bar_diameter=diam, spacing=spacing)
 
@@ -174,6 +200,7 @@ def cross_section_figure(section: LayeredSection, eps0: np.ndarray, kappa: np.nd
     ax.plot(sigma_c2, z_mm, "-", color="black", label=r"$\sigma_{c2r}$")
     ax.plot(sigma_c1, z_mm, "-", color="0.55", label=r"$\sigma_{c1r}$")
     ax.plot(-f_c, z_mm, "-.", color="black", linewidth=0.8, label=r"$f_c$")
+    ax.axvline(section.concrete.fctm, color="0.4", linewidth=0.7, linestyle="--", label=r"$f_{ctm}$")
     ax.axvline(0, color="black", linewidth=0.6)
     ax.set_xlabel(r"$\sigma_{cr}$ [N/mm²]")
     ax.legend(fontsize=7, loc="lower left")
@@ -183,8 +210,8 @@ def cross_section_figure(section: LayeredSection, eps0: np.ndarray, kappa: np.nd
     ax.barh(bar_z_mm, bar_sigma, height=np.maximum(bar_diam_mm, 4.0), color="0.75",
             edgecolor="black", linewidth=0.6)
     # Fix the x-range from the bar data alone (padded) *before* drawing the
-    # fy reference lines - axvline would otherwise stretch the autoscale out
-    # to +-fy even when actual stresses are a small fraction of yield,
+    # fy/fu reference lines - axvline would otherwise stretch the autoscale
+    # out to +-fu even when actual stresses are a small fraction of yield,
     # making the bars themselves nearly invisible for lightly-loaded cases.
     data_max = max(float(np.max(np.abs(bar_sigma))), 1.0) * 1.6
     ax.set_xlim(-data_max, data_max)
@@ -192,6 +219,9 @@ def cross_section_figure(section: LayeredSection, eps0: np.ndarray, kappa: np.nd
     if data_max > section.steel.fy * 0.5:
         ax.axvline(section.steel.fy, color="0.4", linewidth=0.7, linestyle="--", label=r"$f_{sy}$")
         ax.axvline(-section.steel.fy, color="0.4", linewidth=0.7, linestyle="--")
+    if data_max > section.steel.fu * 0.5:
+        ax.axvline(section.steel.fu, color="0.2", linewidth=0.7, linestyle=":", label=r"$f_{su}$")
+        ax.axvline(-section.steel.fu, color="0.2", linewidth=0.7, linestyle=":")
     for z, sigma, label in zip(bar_z_mm, bar_sigma, ["$x,\\mathrm{inf}$", "$y,\\mathrm{inf}$",
                                                       "$x,\\mathrm{sup}$", "$y,\\mathrm{sup}$"]):
         ax.annotate(label, (sigma, z), textcoords="offset points",
@@ -210,16 +240,36 @@ def cross_section_figure(section: LayeredSection, eps0: np.ndarray, kappa: np.nd
     return fig
 
 
+def convergence_figure(history: list):
+    """Residual (SRSS) vs. Newton iteration for the whole solve() call
+    (direct probe, incremental steps, and any escape kicks concatenated in
+    call order - see solver.py's `history` parameter). Log-scale y-axis:
+    residuals typically span many orders of magnitude over a solve, and any
+    upward jump is visually informative - it marks where the solver had to
+    kick past a real constitutive jump (cracking, TCM onset, etc.).
+    """
+    fig, ax = plt.subplots(figsize=(4.6, 2.6))
+    residuals = np.maximum(np.array(history, dtype=float), 1e-12)
+    ax.plot(np.arange(1, len(residuals) + 1), residuals, "-", color="black", linewidth=0.8)
+    ax.set_yscale("log")
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("residual (SRSS)")
+    ax.set_title("Convergence", fontsize=9)
+    ax.grid(True, linewidth=0.3, which="both")
+    fig.tight_layout()
+    return fig
+
+
 with st.sidebar:
     st.header("Geometry")
-    thickness_mm = st.number_input("$h$ [mm]", min_value=80.0, max_value=1000.0, value=250.0, step=10.0)
-    cover_mm = st.number_input(r"$c_\mathrm{nom}$ [mm]", min_value=10.0, max_value=80.0, value=30.0, step=5.0)
+    thickness_mm = st.number_input("$h$ [mm]", min_value=80.0, max_value=1000.0, value=250.0, step=10.0,
+                                    format="%.0f")
+    cover_mm = st.number_input(r"$c_\mathrm{nom}$ [mm]", min_value=10.0, max_value=80.0, value=30.0, step=5.0,
+                                format="%.0f")
 
     st.header("Reinforcement")
-    st.caption(r"Bottom face ($z > 0$, $\mathrm{inf}$)")
     bottom_x = rebar_input("x", "inf", 12.0, 150.0)
     bottom_y = rebar_input("y", "inf", 12.0, 150.0)
-    st.caption(r"Top face ($z < 0$, $\mathrm{sup}$)")
     top_x = rebar_input("x", "sup", 12.0, 150.0)
     top_y = rebar_input("y", "sup", 12.0, 150.0)
 
@@ -228,21 +278,35 @@ with st.sidebar:
     use_auto_concrete = st.checkbox("Auto-fill $E_{cm}$ / $f_{ctm}$ / $\\varepsilon_{c0}$ from $f_{ck}$", value=True)
     if use_auto_concrete:
         concrete = ConcreteMaterial(fck=fck)
+        ecm_str = f"{concrete.Ecm:,.0f}".replace(",", "'")
         st.caption(
-            f"$E_{{cm}}$={concrete.Ecm:.0f} N/mm², "
+            f"$E_{{cm}}$={ecm_str} N/mm², "
             f"$f_{{ctm}}$={concrete.fctm:.2f} N/mm², "
-            f"$\\varepsilon_{{c0}}$={concrete.eps_c0 * 1000:.2f} ‰"
+            f"$\\varepsilon_{{c0}}$={concrete.eps_c0 * 1000:.2f}‰"
         )
     else:
         Ecm = st.number_input("$E_{cm}$ [N/mm²]", min_value=10000.0, max_value=50000.0, value=31500.0, step=500.0)
+        ecm_str = f"{Ecm:,.0f}".replace(",", "'")
+        st.caption(f"$E_{{cm}}$ = {ecm_str} N/mm²")
         fctm = st.number_input("$f_{ctm}$ [N/mm²]", min_value=1.0, max_value=6.0, value=2.9, step=0.1)
         eps_c0 = st.number_input("$\\varepsilon_{c0}$ [‰]", min_value=1.0, max_value=4.0, value=2.1, step=0.1) / 1000.0
         concrete = ConcreteMaterial(fck=fck, Ecm=Ecm, fctm=fctm, eps_c0=eps_c0)
 
     st.header("Reinforcing steel")
-    fy = st.number_input("$f_y$ [N/mm²]", min_value=300.0, max_value=700.0, value=500.0, step=10.0)
-    fu = st.number_input("$f_u$ [N/mm²]", min_value=fy, max_value=900.0, value=max(fy + 50.0, 550.0), step=10.0)
-    Es = st.number_input("$E_s$ [N/mm²]", min_value=150000.0, max_value=220000.0, value=200000.0, step=1000.0)
+    fy = st.number_input("$f_{sy}$ [N/mm²]", min_value=300.0, max_value=700.0, value=500.0, step=10.0)
+    fu = st.number_input("$f_{su}$ [N/mm²]", min_value=fy, max_value=900.0, value=max(fy + 50.0, 550.0), step=10.0)
+    # number_input can't show a "'"-thousands display while staying editable
+    # (a browser <input type=number> limitation) - text_input lets the
+    # apostrophe format show directly in the field itself, at the cost of
+    # manual parsing/validation below.
+    es_text = st.text_input("$E_{sm}$ [N/mm²]", value="200'000")
+    try:
+        Es = float(es_text.replace("'", "").replace(" ", ""))
+        if not (150000.0 <= Es <= 220000.0):
+            st.warning(f"$E_{{sm}}$ should be between 150'000 and 220'000 N/mm² - got {es_text}")
+    except ValueError:
+        st.error(f"Invalid $E_{{sm}}$ value '{es_text}' - using 200'000 N/mm²")
+        Es = 200000.0
     eps_su_pct = st.number_input("$\\varepsilon_{su}$ [%]", min_value=1.0, max_value=15.0, value=5.0, step=0.5)
     steel = SteelMaterial(fy=fy, fu=fu, Es=Es, eps_su=eps_su_pct / 100.0)
 
@@ -251,14 +315,12 @@ with st.sidebar:
     n_concrete_layers = st.slider("Concrete sub-layers", min_value=8, max_value=100, value=30, step=2)
 
     st.header("Loading direction")
-    st.caption(
-        r"Unit distribution $m_i=[n_{xx},n_{yy},n_{xy},m_{xx},m_{yy},m_{xy}]$, "
-        r"scaled by $\kappa$ in each tab below."
-    )
+    st.markdown(r"**Membrane Force Vector** $n_{ij}$ [kN/m]")
     d1, d2, d3 = st.columns(3)
     dir_n_xx = d1.number_input("$n_{xx}$", value=0.0, step=0.1)
     dir_n_yy = d2.number_input("$n_{yy}$", value=0.0, step=0.1)
     dir_n_xy = d3.number_input("$n_{xy}$", value=0.0, step=0.1)
+    st.markdown(r"**Bending and Twisting Moment Vector** $m_{ij}$ [kNm/m]")
     d4, d5, d6 = st.columns(3)
     dir_m_xx = d4.number_input("$m_{xx}$", value=1.0, step=0.1)
     dir_m_yy = d5.number_input("$m_{yy}$", value=0.0, step=0.1)
@@ -278,60 +340,102 @@ with tab_single:
     if direction_norm == 0:
         st.error("Set a nonzero loading direction in the sidebar.")
     else:
-        kappa_scale = st.number_input(
-            r"$\kappa$ (scales the unit distribution: load = $\kappa \times$ direction) "
-            "[kN/m or kNm/m]",
-            value=10.0, step=5.0,
-        )
-        run = st.button("Run analysis", type="primary")
+        btn_col, status_col = st.columns([1, 4], vertical_alignment="center")
+        with btn_col:
+            run = st.button("Run analysis", type="primary")
 
         if run:
             section = LayeredSection(params, concrete, steel, tension_stiffening=tension_stiffening,
                                       n_concrete_layers=n_concrete_layers)
-            forces_vec = kappa_scale * direction.to_vector()
-            forces = SectionForces(*forces_vec.tolist())
-            with st.spinner("Solving..."):
-                result = solve(section, forces)
+            history: list = []
+            start = time.perf_counter()
+            with status_col:
+                with st.spinner("Solving..."):
+                    result = solve(section, direction, history=history)
+            elapsed = time.perf_counter() - start
             st.session_state["result"] = result
             st.session_state["section_for_result"] = section
+            st.session_state["history"] = history
+            st.session_state["elapsed"] = elapsed
 
         if "result" in st.session_state:
             result = st.session_state["result"]
             section = st.session_state["section_for_result"]
+            history = st.session_state["history"]
+            elapsed = st.session_state["elapsed"]
 
-            if result.converged:
-                st.success(f"Converged in {result.iterations} evaluations (residual = {result.residual_norm:.2e})")
-            else:
-                st.error(f"Not converged after {result.iterations} evaluations (residual = {result.residual_norm:.3f})")
-
-            res_col1, res_col2 = st.columns(2)
-            with res_col1:
-                st.latex(
-                    r"\varepsilon_{x,0}=%.4f\,\text{‰}\qquad"
-                    r"\varepsilon_{y,0}=%.4f\,\text{‰}\qquad"
-                    r"\gamma_{xy,0}=%.4f\,\text{‰}"
-                    % tuple(v * 1000 for v in result.eps0)
+            with status_col:
+                # A plain st.success()/st.error() box is noticeably taller
+                # than the button next to it and doesn't align cleanly even
+                # with vertical_alignment="center" - a compact inline badge
+                # matches the button's height instead.
+                badge_style = (
+                    "display:inline-block;padding:0.5rem 0.9rem;border-radius:0.5rem;"
+                    "margin-left:0.6rem;font-size:0.95rem;line-height:1.2;"
                 )
-            with res_col2:
-                st.latex(
-                    r"\kappa_{x}=%.4f\,\text{mrad/m}\qquad"
-                    r"\kappa_{y}=%.4f\,\text{mrad/m}\qquad"
-                    r"\kappa_{xy}=%.4f\,\text{mrad/m}"
-                    % tuple(v * 1000 for v in result.kappa)
-                )
+                if result.converged:
+                    st.markdown(
+                        f'<div style="{badge_style}background-color:#d4edda;color:#155724;">'
+                        f"✓ Converged in {result.iterations} iterations ({elapsed:.3f} s) "
+                        f"— residual = {result.residual_norm:.2e}</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div style="{badge_style}background-color:#f8d7da;color:#721c24;">'
+                        f"✗ Not converged after {result.iterations} iterations ({elapsed:.3f} s) "
+                        f"— residual = {result.residual_norm:.3f}</div>",
+                        unsafe_allow_html=True,
+                    )
 
             _, layer_data = section.internal_forces(result.eps0, result.kappa)
             concrete_entries = [(z, s) for kind, z, s in layer_data if kind == "concrete"]
             theta_top = concrete_entries[0][1].theta1
             theta_bottom = concrete_entries[-1][1].theta1
 
-            plan_col, _ = st.columns([1, 2])
-            with plan_col:
-                st.pyplot(plan_view_figure(params, theta_bottom, theta_top))
+            st.latex(
+                r"[\varepsilon_{x,0},\ \varepsilon_{y,0},\ \gamma_{xy,0}]="
+                r"[%.4f,\ %.4f,\ %.4f]\text{‰}"
+                r"\qquad"
+                r"[\kappa_{x},\ \kappa_{y},\ \kappa_{xy}]="
+                r"[%.4f,\ %.4f,\ %.4f]\,\text{mrad/m}"
+                % (tuple(v * 1000 for v in result.eps0) + tuple(v * 1000 for v in result.kappa))
+            )
 
             st.pyplot(cross_section_figure(section, result.eps0, result.kappa))
+
+            bottom_resp = next(state for kind, z, state in layer_data if kind == "reinforcement" and z > 0)
+            top_resp = next(state for kind, z, state in layer_data if kind == "reinforcement" and z < 0)
+            sigma_c_bottom = concrete_entries[-1][1]
+            sigma_c_top = concrete_entries[0][1]
+
+            st.latex(
+                r"[\sigma_{sx,\mathrm{inf}},\ \sigma_{sy,\mathrm{inf}},\ "
+                r"\sigma_{sx,\mathrm{sup}},\ \sigma_{sy,\mathrm{sup}}]="
+                r"[%.1f,\ %.1f,\ %.1f,\ %.1f]\,\text{N/mm}^2"
+                % (bottom_resp.sigma_x, bottom_resp.sigma_y, top_resp.sigma_x, top_resp.sigma_y)
+            )
+            st.latex(
+                r"[\sigma_{c1,\mathrm{inf}},\ \sigma_{c2,\mathrm{inf}},\ "
+                r"\sigma_{c1,\mathrm{sup}},\ \sigma_{c2,\mathrm{sup}}]="
+                r"[%.2f,\ %.2f,\ %.2f,\ %.2f]\,\text{N/mm}^2"
+                % (sigma_c_bottom.sigma1, sigma_c_bottom.sigma2, sigma_c_top.sigma1, sigma_c_top.sigma2)
+            )
+
+            # Plan view (crack pattern) and convergence plots: reported not
+            # rendering correctly for the user - disabled rather than
+            # deleted, pending further investigation. plan_view_figure /
+            # convergence_figure / the theta_top/theta_bottom computation
+            # above and the `history` list collected from solve() are all
+            # still intact and ready to re-enable.
+            # bottom_col1, bottom_col2 = st.columns(2)
+            # with bottom_col1:
+            #     st.pyplot(plan_view_figure(params, theta_bottom, theta_top))
+            # with bottom_col2:
+            #     if history:
+            #         st.pyplot(convergence_figure(history))
         else:
-            st.info("Set $\\kappa$ and click **Run analysis**.")
+            st.info("Click **Run analysis**.")
 
 with tab_curve:
     if direction_norm == 0:
