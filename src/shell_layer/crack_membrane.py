@@ -74,12 +74,14 @@ def concrete_stress(eps_x: float, eps_y: float, gamma_xy: float,
         sigma2 = factor * (eps2 + nu * eps1)
 
     elif 0 <= eps1 <= eps_ct and eps2 <= 0:
-        # [2] Uncracked, light tension-compression. Uses the tangent-matched
-        # compression law so the stiffness is continuous with State [1]
-        # across eps2=0 (no artificial jump right at the crack-free origin).
-        f_c = min(2.5 * mat.fck ** (2.0 / 3.0), mat.fck)
+        # [2] Uncracked, light tension-compression. Per MatConcrete.m / the
+        # State [2] branch in Slab_Solver.m: f_c is the eps1-softened peak
+        # compressive strength (same formula as peak_compressive_stress),
+        # not the flat 2.5*fck^(2/3) cap - and sigma2 is the plain parabola,
+        # not tangent-matched to Ecm.
+        f_c = mat.peak_compressive_stress(eps1)
         sigma1 = mat.Ecm * eps1
-        sigma2 = mat.compression_stress_matched(eps2, f_c)
+        sigma2 = mat.compression_stress(eps2, f_c)
         sigma_x, sigma_y, tau_xy = _to_cartesian(sigma1, sigma2, theta1)
 
     elif eps1 >= eps_ct and eps2 <= 0:

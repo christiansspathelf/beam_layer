@@ -57,15 +57,37 @@ many sequential gaps as more layers crack, not a bug. Using more
 `n_concrete_layers` shrinks each individual gap (better precision, slower
 solve); full robustness across all load levels would need arc-length/Riks
 continuation, which this solver does not implement.
+
+**Tangent**: every Newton iteration here uses `complex_step.
+tangent_complex_step`, not `LayeredSection.tangent`'s central finite
+difference. The two were compared directly (see
+`experiments/spathelf2018_validation/complex_step_verify.py`): the
+finite-difference tangent's error is *not* confined to the discrete jumps
+described above - it was measured at ~2x off from the closed-form elastic
+tangent even in a fully uncracked, unambiguous state, because its fixed
+step (1e-5) isn't always small relative to the strain state itself.
+Complex-step gives the exact one-sided derivative of whichever constitutive
+branch the current state is on, with no such step-size compromise (see
+`complex_step.py`'s module docstring for why). It measurably improves
+convergence (fewer iterations; a previously-nonconvergent case now solves
+cleanly - see the docstring's Case-2/ML8 discussion in that experiment
+script) but does not and cannot fix a case failing because the *true*
+capacity has genuinely been exceeded (a near-singular tangent right at a
+real limit point is inherent to the physics, not a tangent-computation
+artifact) - see the module's remaining `is_physically_sane` discussion and
+`arclength.py` for that situation.
 """
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 
+from .complex_step import tangent_complex_step
 from .loading import SectionForces
 from .results import AnalysisResult, LayerResult
 from .section import LayeredSection
+
+TangentFn = Callable[[LayeredSection, np.ndarray, np.ndarray], np.ndarray]
 
 MPA_TO_KPA = 1000.0
 
@@ -77,7 +99,7 @@ _STAGNATION_REL_IMPROVEMENT = 0.02  # give up early if <2% improvement over the 
 
 
 def _damped_newton(section: LayeredSection, target: np.ndarray, u0: np.ndarray,
-                    tol: float, max_iter: int):
+                    tol: float, max_iter: int, tangent_fn: Optional[TangentFn] = None):
     """Fixed-target damped Newton solve. Returns (u, residual_norm, iterations, converged, last_d_u).
 
     Gives up early (before `max_iter`) if the residual stalls: once a run is
@@ -86,7 +108,14 @@ def _damped_newton(section: LayeredSection, target: np.ndarray, u0: np.ndarray,
     (`solve`) is going to try an escape kick or accept the best point and
     move on regardless. `last_d_u` (the most recent, un-backtracked Newton
     direction) is returned so the caller can use it for that escape kick.
+
+    `tangent_fn(section, eps0, kappa) -> 6x6 array` overrides how the
+    tangent stiffness is computed; defaults to `complex_step.
+    tangent_complex_step` (see module docstring). Pass
+    `lambda sec, e, k: sec.tangent(e, k)` to fall back to the older central
+    finite difference, e.g. for comparison.
     """
+    tangent_fn = tangent_fn or tangent_complex_step
     u = u0.copy()
     residual_norm = float("inf")
     stagnation_ref = float("inf")
@@ -104,7 +133,7 @@ def _damped_newton(section: LayeredSection, target: np.ndarray, u0: np.ndarray,
                 return u, residual_norm, iterations, False, last_d_u
             stagnation_ref = residual_norm
 
-        K = section.tangent(eps0, kappa)
+        K = tangent_fn(section, eps0, kappa)
         try:
             d_u = np.linalg.solve(K, residual)
         except np.linalg.LinAlgError:
@@ -121,6 +150,26 @@ def _damped_newton(section: LayeredSection, target: np.ndarray, u0: np.ndarray,
         u = u + step * d_u
 
     return u, residual_norm, max_iter, False, last_d_u
+
+
+_DIRECT_PROBE_MAX_ITER = 40
+"""Bounded attempt at solving directly for the full target before paying for
+incremental load-stepping. Kept small deliberately: `_damped_newton`'s own
+stagnation detection (window=15) already bails out well before this if the
+probe isn't making progress, so a failed probe costs at most a few tens of
+iterations - small next to the hundreds-to-thousands a genuinely hard,
+heavily cracked case needs anyway - while a probe that *does* succeed
+(typical for lightly loaded/uncracked sections, or any case whose starting
+point is already close) skips the incremental machinery entirely.
+
+A coarse-mesh "solve a simplified model first, use its result as the
+starting point" warm start was also tried here and measured empirically
+(see git history) to make heavily cracked cases *slower*, not faster: the
+coarse model's own discretization gaps are much larger (gap size scales
+with 1/n_concrete_layers), so its converged cracked/uncracked configuration
+does not reliably correspond to the fine model's - the fine solve then has
+to un-do a confidently-wrong starting guess rather than refine a roughly-
+right one. It was dropped in favor of this cheap, bounded probe."""
 
 
 _ESCAPE_KICK_FACTORS = (1.5, 3.0, 6.0, 12.0)
@@ -142,7 +191,7 @@ def is_physically_sane(u: np.ndarray) -> bool:
 
 
 def _try_escape_kick(section: LayeredSection, sub_target: np.ndarray, u_stuck: np.ndarray,
-                      d_u: np.ndarray, tol: float):
+                      d_u: np.ndarray, tol: float, tangent_fn: Optional[TangentFn] = None):
     """When stuck right at a discretization gap, incremental backtracked steps
     keep landing just short of it (the whole point of backtracking is to
     require improvement, which is exactly what's impossible from inside the
@@ -161,7 +210,8 @@ def _try_escape_kick(section: LayeredSection, sub_target: np.ndarray, u_stuck: n
         u_kicked = u_stuck + factor * d_u
         if not is_physically_sane(u_kicked):
             continue
-        u_final, rn, iters, ok, _ = _damped_newton(section, sub_target, u_kicked, tol, _ESCAPE_KICK_MAX_ITER)
+        u_final, rn, iters, ok, _ = _damped_newton(section, sub_target, u_kicked, tol,
+                                                    _ESCAPE_KICK_MAX_ITER, tangent_fn)
         extra_iterations += iters
         if not is_physically_sane(u_final):
             continue
@@ -172,80 +222,7 @@ def _try_escape_kick(section: LayeredSection, sub_target: np.ndarray, u_stuck: n
     return best_u, best_res, extra_iterations, False
 
 
-def solve(
-    section: LayeredSection,
-    forces: SectionForces,
-    tol: float = 1e-3,
-    max_iter: int = 250,
-    initial_guess: Optional[np.ndarray] = None,
-    initial_step_fraction: float = 0.25,
-    min_step_fraction: float = 1.0 / 256,
-    total_iteration_budget: int = 20_000,
-) -> AnalysisResult:
-    """Solve for the mid-surface strain/curvature state matching `forces`.
-
-    `max_iter` bounds the damped-Newton iterations used *within each load
-    increment*, not the total step count. `initial_step_fraction` and
-    `min_step_fraction` control the adaptive load-stepping: a step starts at
-    `initial_step_fraction` of the full load and is halved on failure, down
-    to `min_step_fraction`, before an escape-kick attempt (see
-    `_try_escape_kick`) and, failing that, accepting the best point found and
-    continuing. `total_iteration_budget` is a hard cap on the whole solve
-    (mainly a safety net for load levels that keep hitting one gap after
-    another) - it stops and returns the best state found so far rather than
-    running indefinitely; `AnalysisResult.converged=False` in that case means
-    genuinely take the result as unconverged, not as "wait longer".
-    """
-    target = forces.to_vector()
-    u = np.array(_DEFAULT_INITIAL_GUESS if initial_guess is None else initial_guess, dtype=float)
-
-    frac = 0.0
-    step = initial_step_fraction
-    total_iterations = 0
-
-    while frac < 1.0 - 1e-12 and total_iterations < total_iteration_budget:
-        next_frac = min(frac + step, 1.0)
-        sub_target = target * next_frac
-
-        u_trial, step_residual_norm, iters, ok, d_u = _damped_newton(section, sub_target, u, tol, max_iter)
-        total_iterations += iters
-
-        if ok:
-            u = u_trial
-            frac = next_frac
-            step = min(step * 1.5, initial_step_fraction)
-        else:
-            # A failure is far more often a genuine gap (see module
-            # docstring) than a step that's merely too large - halving
-            # repeatedly before trying to escape wastes many iterations
-            # re-discovering the same wall, since halving cannot cross a gap
-            # by construction. Try the (cheap, bounded) escape kick first;
-            # only fall back to halving if the kick can't beat what halving
-            # would find anyway.
-            u_kicked, kicked_res, kick_iters, kicked_ok = _try_escape_kick(
-                section, sub_target, u_trial, d_u, tol)
-            total_iterations += kick_iters
-            if kicked_ok or kicked_res < step_residual_norm:
-                u = u_kicked
-                frac = next_frac
-                step = initial_step_fraction
-                continue
-
-            step /= 2.0
-            if step < min_step_fraction:
-                # Neither halving nor the kick could reach this increment's
-                # target - accept the best point found (still the tightest
-                # of u_trial/u_kicked, already compared above) and keep
-                # marching toward the full load rather than aborting.
-                u = u_trial
-                frac = next_frac
-                step = initial_step_fraction
-
-    eps0, kappa = u[:3], u[3:]
-    F, layer_data = section.internal_forces(eps0, kappa)
-    residual_norm = float(np.linalg.norm(target - F))
-    converged = frac >= 1.0 - 1e-12 and residual_norm <= tol
-
+def _build_layer_results(layer_data) -> List[LayerResult]:
     layers: List[LayerResult] = []
     for kind, z, state in layer_data:
         if kind == "concrete":
@@ -262,8 +239,138 @@ def solve(
                 stress=np.array([state.sigma_x, state.sigma_y, 0.0]) * MPA_TO_KPA,
                 cracked=state.cracked, theta=None,
             ))
+    return layers
+
+
+def solve(
+    section: LayeredSection,
+    forces: SectionForces,
+    tol: float = 1e-3,
+    max_iter: int = 250,
+    initial_guess: Optional[np.ndarray] = None,
+    initial_step_fraction: float = 0.25,
+    min_step_fraction: float = 1.0 / 256,
+    total_iteration_budget: int = 20_000,
+    direct_probe: bool = True,
+    tangent_fn: Optional[TangentFn] = None,
+) -> AnalysisResult:
+    """Solve for the mid-surface strain/curvature state matching `forces`.
+
+    Before the incremental-stepping machinery below is touched, a single
+    damped-Newton solve straight at the full `forces` target is tried from
+    the starting point (`initial_guess` if supplied, else the generic
+    default). This is cheap even when it fails - bounded to
+    `_DIRECT_PROBE_MAX_ITER` iterations, and `_damped_newton`'s stagnation
+    detection usually bails out well before that - and when it succeeds
+    (typically an uncracked or lightly cracked section, or any case whose
+    starting point happens to already be close) it skips the incremental
+    machinery entirely. Disable with `direct_probe=False` if a caller knows
+    in advance the probe cannot succeed (e.g. `trace_path`'s escape kicks
+    aim at a deliberately-overshot target that the probe has no chance of
+    reaching directly).
+
+    If the probe fails, the solver falls back to the adaptive incremental
+    load-stepping described below, starting fresh from the *original*
+    starting point - deliberately not from wherever the failed probe ended
+    up. Reusing the probe's endpoint was tried and measured to make heavily
+    cracked cases slower, not faster (see git history and
+    `_DIRECT_PROBE_MAX_ITER`'s docstring for a related finding): a failed
+    full-target Newton attempt does not leave behind a better starting point
+    for gradual load-stepping than the untouched original guess.
+
+    `max_iter` bounds the damped-Newton iterations used *within each load
+    increment*, not the total step count. `initial_step_fraction` and
+    `min_step_fraction` control the adaptive load-stepping: a step starts at
+    `initial_step_fraction` of the full load and is halved on failure, down
+    to `min_step_fraction`, before an escape-kick attempt (see
+    `_try_escape_kick`) and, failing that, accepting the best point found and
+    continuing. `total_iteration_budget` is a hard cap on the whole solve,
+    including the direct-solve probe (mainly a safety net for load levels
+    that keep hitting one gap after another) - it stops and returns the best
+    state found so far rather than running indefinitely;
+    `AnalysisResult.converged=False` in that case means genuinely take the
+    result as unconverged, not as "wait longer".
+
+    `tangent_fn` overrides how every internal Newton solve (direct probe,
+    incremental steps, escape kicks) computes its tangent stiffness;
+    defaults to `complex_step.tangent_complex_step` (see module docstring).
+    """
+    target = forces.to_vector()
+    u_start = np.array(_DEFAULT_INITIAL_GUESS if initial_guess is None else initial_guess, dtype=float)
+    total_iterations = 0
+
+    if direct_probe:
+        probe_max_iter = min(max_iter, _DIRECT_PROBE_MAX_ITER)
+        u_direct, direct_res, direct_iters, direct_ok, _ = _damped_newton(
+            section, target, u_start, tol, probe_max_iter, tangent_fn)
+        total_iterations += direct_iters
+        if direct_ok:
+            eps0, kappa = u_direct[:3], u_direct[3:]
+            _, layer_data = section.internal_forces(eps0, kappa)
+            return AnalysisResult(
+                eps0=eps0, kappa=kappa, layers=_build_layer_results(layer_data),
+                converged=True, iterations=total_iterations, residual_norm=direct_res,
+            )
+
+    u = u_start
+    frac = 0.0
+    step = initial_step_fraction
+
+    while frac < 1.0 - 1e-12 and total_iterations < total_iteration_budget:
+        next_frac = min(frac + step, 1.0)
+        sub_target = target * next_frac
+
+        u_trial, step_residual_norm, iters, ok, d_u = _damped_newton(
+            section, sub_target, u, tol, max_iter, tangent_fn)
+        total_iterations += iters
+
+        if ok:
+            u = u_trial
+            frac = next_frac
+            step = min(step * 1.5, initial_step_fraction)
+        else:
+            # A failure is far more often a genuine gap (see module
+            # docstring) than a step that's merely too large - halving
+            # repeatedly before trying to escape wastes many iterations
+            # re-discovering the same wall, since halving cannot cross a gap
+            # by construction. Try the (cheap, bounded) escape kick first;
+            # only fall back to halving if the kick can't beat what halving
+            # would find anyway.
+            u_kicked, kicked_res, kick_iters, kicked_ok = _try_escape_kick(
+                section, sub_target, u_trial, d_u, tol, tangent_fn)
+            total_iterations += kick_iters
+            if kicked_ok or kicked_res < step_residual_norm:
+                u = u_kicked
+                frac = next_frac
+                step = initial_step_fraction
+                continue
+
+            step /= 2.0
+            if step < min_step_fraction:
+                # Neither halving nor the kick could reach this increment's
+                # target - accept the best point found and keep marching
+                # toward the full load rather than aborting. Unlike the
+                # escape-kick path above (which already sanity-checks its
+                # own candidates inside `_try_escape_kick`), `u_trial` here
+                # is a raw damped-Newton output with no such guard - right at
+                # a discretization gap the finite-difference tangent is
+                # unreliable (see module docstring), so a bad Newton
+                # direction can pass backtracking's "improving residual"
+                # check while still landing somewhere absurd. Only accept it
+                # if it's physically sane; otherwise hold the last known-good
+                # state and just advance past this increment rather than
+                # propagating a blown-up value into the rest of the solve.
+                if is_physically_sane(u_trial):
+                    u = u_trial
+                frac = next_frac
+                step = initial_step_fraction
+
+    eps0, kappa = u[:3], u[3:]
+    F, layer_data = section.internal_forces(eps0, kappa)
+    residual_norm = float(np.linalg.norm(target - F))
+    converged = frac >= 1.0 - 1e-12 and residual_norm <= tol
 
     return AnalysisResult(
-        eps0=eps0, kappa=kappa, layers=layers,
+        eps0=eps0, kappa=kappa, layers=_build_layer_results(layer_data),
         converged=converged, iterations=total_iterations, residual_norm=residual_norm,
     )

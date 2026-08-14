@@ -60,20 +60,3 @@ class ConcreteMaterial:
             return 0.0
         return f_c * (eps2**2 + 2.0 * eps2 * self.eps_c0) / self.eps_c0**2
 
-    def compression_stress_matched(self, eps2: float, f_c: float) -> float:
-        """Principal compressive stress [MPa], as `compression_stress`, but
-        with initial tangent forced to Ecm at eps2=0.
-
-        `compression_stress`'s tangent at the origin is 2*f_c/eps_c0, which
-        generally isn't Ecm - fine deep in a cracked/softened state, but a
-        real discontinuity right where State [1] (uncracked, full Ecm) hands
-        off to State [2] (light tension-compression) at eps2=0. This uses a
-        quadratic pinned to (stress=0, tangent=Ecm) at eps2=0 and
-        (stress=-f_c) at eps2=-eps_c0, capped at -f_c so it can't overshoot
-        the target peak strength in between.
-        """
-        if eps2 < -self.eps_c0:
-            return 0.0
-        a = (self.Ecm * self.eps_c0 - f_c) / self.eps_c0**2
-        sigma = self.Ecm * eps2 + a * eps2**2
-        return max(sigma, -f_c)
