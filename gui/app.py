@@ -26,6 +26,10 @@ from shell_layer import (  # noqa: E402
     solve,
     trace_path,
 )
+from shell_layer.crack_membrane import principal_strain  # noqa: E402
+from shell_layer.materials.steel import steel_stress_tangent  # noqa: E402
+from shell_layer.reinforcement import crack_spacing  # noqa: E402
+from shell_layer.section import strain_at  # noqa: E402
 
 KPA_TO_NMM2 = 1e-3  # kN/m^2 -> N/mm^2
 
@@ -260,6 +264,90 @@ def convergence_figure(history: list):
     return fig
 
 
+def steel_characteristic_figure(curves: list, eps_max_permil: float):
+    """Each bar's own operative stress-strain curve (bare bilinear - solid
+    black - or TCM - dotted black - if tension stiffening is on *and* that
+    bar's panel is actually cracked, matching exactly what governs its real
+    response, not a generic reference curve) with the analysis's resulting
+    (mean strain, stress) point marked on it. Tensile quadrant only
+    (eps_m >= 0). `curves`: list of (label, eps_range_permil, sigma_range,
+    point_eps_permil, point_sigma, is_tcm). Markers are drawn in a second
+    pass, after every curve, so they sit on top of all lines regardless of
+    draw order; white fill with a black edge, one marker shape per bar
+    (curves no longer being individually colored), keeps them legible.
+    """
+    fig, ax = plt.subplots(figsize=(5.5, 3.2))
+    marker_shapes = ["o", "s", "^", "D"]
+    to_mark = []
+    for (label, eps_range, sigma_range, point_eps, point_sigma, is_tcm), marker in zip(curves, marker_shapes):
+        linestyle = ":" if is_tcm else "-"
+        ax.plot(eps_range, sigma_range, linestyle, color="black", linewidth=1.0, label=label, zorder=2)
+        to_mark.append((marker, point_eps, point_sigma))
+    for marker, point_eps, point_sigma in to_mark:
+        ax.plot(point_eps, point_sigma, marker, markersize=6.5, markerfacecolor="white",
+                 markeredgecolor="black", markeredgewidth=1.4, zorder=5)
+    ax.axhline(0, color="black", linewidth=0.5)
+    ax.set_xlim(0, eps_max_permil)
+    ax.set_xlabel(r"$\varepsilon_{sm}$ [‰]")
+    ax.set_ylabel(r"$\sigma_s$ [N/mm²]")
+    ax.set_title("Reinforcing steel (tensile quadrant)", fontsize=9)
+    ax.legend(fontsize=6, loc="best")
+    ax.grid(True, linewidth=0.3)
+    fig.tight_layout()
+    return fig
+
+
+def concrete_characteristic_figure(concrete: ConcreteMaterial, layers: list, eps_max_permil: float):
+    """One compressive stress-strain curve *per outer layer* (inf/sup),
+    each using that layer's own companion-strain-softened peak compressive
+    stress (`peak_compressive_stress(eps1)` when eps1>=0, matching States
+    [2]/[3]'s own formula in crack_membrane.py; falls back to the
+    unsoftened `fck` when eps1<0, matching State [6]) - not one generic
+    fck-based reference curve. A single shared curve made the c1/c2 points
+    visibly miss it whenever the companion strain softened that layer's
+    real peak strength; an adapted curve per layer puts sigma2 (whichever
+    branch's formula this matches) back exactly on its own curve, and
+    keeps sigma1 comparable on the same axes even where it's off-curve
+    (e.g. still on the tensile side).
+
+    Compressive quadrant only, sign flipped for display (axes titled
+    -eps/-sigma) so plotted values read positive - the underlying
+    strain/stress stay negative (compressive) in the solver's own sign
+    convention. `layers`: list of (layer_label, eps1_permil, sigma1,
+    eps2_permil, sigma2).
+    """
+    eps_c0_permil = concrete.eps_c0 * 1000
+    eps_mag = np.linspace(0, eps_max_permil, 300)  # displayed magnitude, = -eps
+    eps_actual = -eps_mag
+
+    fig, ax = plt.subplots(figsize=(5.5, 3.2))
+    linestyles = ["-", "--"]
+    point_markers = {"c1": "o", "c2": "s"}
+
+    for (layer_label, eps1, sigma1, eps2, sigma2), linestyle in zip(layers, linestyles):
+        eps1_actual = eps1 / 1000.0
+        f_c = concrete.peak_compressive_stress(eps1_actual) if eps1_actual >= 0 else concrete.fck
+        sigma_actual = f_c * (eps_actual**2 + 2 * eps_actual * eps_c0_permil) / eps_c0_permil**2
+        sigma_actual = np.where(eps_actual < -eps_c0_permil, 0.0, sigma_actual)
+        ax.plot(eps_mag, -sigma_actual, linestyle, color="black", linewidth=1.0,
+                label=f"{layer_label} (adapted)", zorder=2)
+        for comp_label, eps, sigma in ((r"$c1,\mathrm{%s}$" % layer_label, eps1, sigma1),
+                                        (r"$c2,\mathrm{%s}$" % layer_label, eps2, sigma2)):
+            marker = point_markers["c1" if "c1" in comp_label else "c2"]
+            ax.plot(-eps, -sigma, marker, markersize=6.5, markerfacecolor="white",
+                     markeredgecolor="black", markeredgewidth=1.4, label=comp_label, zorder=5)
+
+    ax.axhline(0, color="black", linewidth=0.5)
+    ax.set_xlim(0, eps_max_permil)
+    ax.set_xlabel(r"$-\varepsilon_c$ [‰]")
+    ax.set_ylabel(r"$-\sigma_c$ [N/mm²]")
+    ax.set_title("Concrete (compressive quadrant)", fontsize=9)
+    ax.legend(fontsize=6, loc="best")
+    ax.grid(True, linewidth=0.3)
+    fig.tight_layout()
+    return fig
+
+
 with st.sidebar:
     st.header("Geometry")
     thickness_mm = st.number_input("$h$ [mm]", min_value=80.0, max_value=1000.0, value=250.0, step=10.0,
@@ -421,6 +509,63 @@ with tab_single:
                 r"[%.2f,\ %.2f,\ %.2f,\ %.2f]\,\text{N/mm}^2"
                 % (sigma_c_bottom.sigma1, sigma_c_bottom.sigma2, sigma_c_top.sigma1, sigma_c_top.sigma2)
             )
+
+            # Steel: each bar's own operative curve - bare bilinear, or TCM
+            # (with that bar's real diameter and its panel's real crack
+            # spacing) if tension stiffening is on *and* that panel is
+            # actually cracked (a panel-level flag, shared by its x/y bars -
+            # see reinforcement.py's panel_response). Not a single generic
+            # reference curve, so it's honest about what really governs
+            # each point.
+            ex_b, ey_b, gxy_b = strain_at(section.bottom_panel.z, result.eps0, result.kappa)
+            ex_t, ey_t, gxy_t = strain_at(section.top_panel.z, result.eps0, result.kappa)
+            _, _, theta1_b = principal_strain(ex_b, ey_b, gxy_b)
+            _, _, theta1_t = principal_strain(ex_t, ey_t, gxy_t)
+            s_rm0_b = crack_spacing(section.bottom_panel.s_rm0_x, section.bottom_panel.s_rm0_y, theta1_b)
+            s_rm0_t = crack_spacing(section.top_panel.s_rm0_x, section.top_panel.s_rm0_y, theta1_t)
+            tau_b0 = 2.0 * concrete.fctm
+            tau_b1 = concrete.fctm
+
+            steel_bar_defs = [
+                (r"$x,\mathrm{inf}$", section.bottom_panel.diam_x, s_rm0_b, bottom_resp.cracked,
+                 ex_b, bottom_resp.sigma_x),
+                (r"$y,\mathrm{inf}$", section.bottom_panel.diam_y, s_rm0_b, bottom_resp.cracked,
+                 ey_b, bottom_resp.sigma_y),
+                (r"$x,\mathrm{sup}$", section.top_panel.diam_x, s_rm0_t, top_resp.cracked,
+                 ex_t, top_resp.sigma_x),
+                (r"$y,\mathrm{sup}$", section.top_panel.diam_y, s_rm0_t, top_resp.cracked,
+                 ey_t, top_resp.sigma_y),
+            ]
+            eps_max_steel = max(
+                steel.eps_su * 1000 * 1.05,
+                max(eps * 1000 for *_, eps, _sig in steel_bar_defs) * 1.3,
+            )
+            eps_range_steel = np.linspace(0, eps_max_steel, 300)
+            steel_curves = []
+            for label, diam, s_rm0, cracked, point_eps, point_sigma in steel_bar_defs:
+                ts_active = tension_stiffening and cracked
+                sigma_range = np.array([
+                    steel_stress_tangent(e / 1000.0, steel, ts_active, diam, s_rm0, tau_b0, tau_b1)[0]
+                    for e in eps_range_steel
+                ])
+                steel_curves.append((label, eps_range_steel, sigma_range, point_eps * 1000, point_sigma, ts_active))
+
+            concrete_layers = [
+                ("inf", sigma_c_bottom.eps1 * 1000, sigma_c_bottom.sigma1,
+                 sigma_c_bottom.eps2 * 1000, sigma_c_bottom.sigma2),
+                ("sup", sigma_c_top.eps1 * 1000, sigma_c_top.sigma1,
+                 sigma_c_top.eps2 * 1000, sigma_c_top.sigma2),
+            ]
+            eps_max_concrete = max(
+                concrete.eps_c0 * 1000 * 1.3,
+                max(abs(eps) for _lbl, eps1, _s1, eps2, _s2 in concrete_layers for eps in (eps1, eps2)) * 1.3,
+            )
+
+            char_col1, char_col2 = st.columns(2)
+            with char_col1:
+                st.pyplot(steel_characteristic_figure(steel_curves, eps_max_steel))
+            with char_col2:
+                st.pyplot(concrete_characteristic_figure(concrete, concrete_layers, eps_max_concrete))
 
             # Plan view (crack pattern) and convergence plots: reported not
             # rendering correctly for the user - disabled rather than

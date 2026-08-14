@@ -149,27 +149,66 @@ results.py (AnalysisResult / LayerResult)
   between very different values at nearly the same `lambda`, 200+ iterations)
   rather than crossing cleanly. Extending complex-step / a similar fix to
   `arclength.py` would be the natural next step, not yet done.
-- **`gui/app.py`**: Streamlit front end, tabbed — "Single load analysis" (point
-  `solve()` + 5-subplot through-thickness figure + schematic plan view with
-  crack pattern + a residual-vs-iteration convergence plot, in that vertical
-  order - the wide 5-subplot figure comes first, plan view and convergence
-  sit side-by-side below it) and "Complete load-deformation curve"
-  (`trace_path()`). Adds `src/` to `sys.path` manually rather than relying on
-  the editable install. `solve()`'s optional `history` list parameter
-  captures a residual-per-iteration trace across the whole call (probe +
-  incremental steps + kicks) for that convergence plot - purely
-  observational, see `solver.py`'s docstring. A defensive retry wraps
-  `matplotlib.mathtext.MathTextParser.parse` at module load: under
-  Streamlit's threaded execution, the first mathtext calls in a process can
-  intermittently raise a spurious `ParseException` on valid strings (a
-  mathtext-cache race, reproduced with plain `$x$` failing once then
-  succeeding immediately after) - not a real syntax problem, don't
-  "fix" it by rewriting label strings.
+- **`gui/app.py`**: Streamlit front end, tabbed — "Single load analysis" and
+  "Complete load-deformation curve" (`trace_path()`). Adds `src/` to
+  `sys.path` manually rather than relying on the editable install.
+
+  **Single load analysis**, top to bottom: run button + a compact inline
+  status badge (not `st.success`/`st.error` - those are noticeably taller
+  than the button next to them) sharing one row via
+  `st.columns(..., vertical_alignment="center")`; the sidebar's loading
+  direction values are used directly as the load (no extra kappa scaling
+  factor - `solve(section, direction, ...)`, `direction` built straight
+  from the sidebar `n_ij`/`m_ij` inputs); the full-width 5-subplot
+  through-thickness figure; single-line vector results (strains+curvatures
+  merged into one `st.latex` call, unit written once; separate lines for
+  reinforcement and concrete principal stresses); then two
+  stress-strain characteristic plots side by side:
+  - `steel_characteristic_figure`: each of the 4 bars' own *operative*
+    curve - bare bilinear (solid black) or TCM (dotted black), using that
+    bar's real diameter and its panel's real crack spacing, and only
+    switching to TCM if tension stiffening is on *and* that panel is
+    actually cracked (a panel-level flag shared by its x/y bars - see
+    `reinforcement.py`'s `panel_response`) - not one generic reference
+    curve. Tensile quadrant only. Markers: white fill, black edge, one
+    shape per bar (`o`/`s`/`^`/`D`), drawn in a second pass so they sit on
+    top of every line regardless of draw order.
+  - `concrete_characteristic_figure`: one curve *per outer layer*
+    (inf solid, sup dashed), each using that layer's own companion-strain-
+    softened `peak_compressive_stress(eps1)` (falling back to unsoftened
+    `fck` when that layer's `eps1<0`, matching State [6] - see
+    `crack_membrane.py`) - a single fck-based reference curve visibly
+    missed the actual `sigma2` points whenever softening was active.
+    Compressive quadrant only, sign flipped for display (axes titled
+    `-eps`/`-sigma` so plotted values read positive) - the underlying
+    values stay negative in the solver's own convention.
+
+  Plan view (crack pattern) and the residual-vs-iteration convergence plot
+  (`plan_view_figure`, `convergence_figure`) are implemented but currently
+  **disabled** in the display (commented out, not deleted) - reported not
+  rendering correctly for the user; the `theta_top`/`theta_bottom`
+  computation and the `history` list from `solve()` that feed them are
+  still computed and ready to re-enable once that's debugged.
+  `solve()`'s optional `history` list parameter captures a
+  residual-per-iteration trace across the whole call (probe + incremental
+  steps + kicks) - purely observational, see `solver.py`'s docstring.
+
+  A defensive retry wraps `matplotlib.mathtext.MathTextParser.parse` at
+  module load: under Streamlit's threaded execution, the first mathtext
+  calls in a process can intermittently raise a spurious `ParseException`
+  on valid strings (a mathtext-cache race, reproduced with plain `$x$`
+  failing once then succeeding immediately after) - not a real syntax
+  problem, don't "fix" it by rewriting label strings.
+
   **Formatting convention**: no space (nor `\,`) between a formatted number
   and a `%`/`‰` suffix in either f-strings or LaTeX (`st.latex`) - e.g.
   `f"{x:.2f}‰"`, not `f"{x:.2f} ‰"` or `r"...\,\text{‰}"`. Bar
-  diameter/spacing and shell thickness/cover inputs use
-  `format="%.0f"` (whole millimetres, no decimals).
+  diameter/spacing and shell thickness/cover inputs use `format="%.0f"`
+  (whole millimetres, no decimals). Large material moduli (`E_sm`, steel)
+  use a `st.text_input` with a `'`-thousands display (`"200'000"`, parsed
+  manually) rather than `st.number_input` - a native number input can't
+  show a custom thousands separator while staying editable, a browser
+  limitation, not a Streamlit one.
 
 ## Conventions worth knowing before editing
 
@@ -189,3 +228,17 @@ results.py (AnalysisResult / LayerResult)
   — don't "fix" a `converged=False`, a kink in a traced curve, or an
   unexpectedly nonlinear "elastic" response without first checking whether
   it's one of these.
+- **Concrete has no post-peak compression softening branch by design, not
+  by omission**: `compression_stress`/State [6] cut off to zero stress the
+  instant `|eps2| > eps_c0`, no gradual descent — confirmed to match
+  `Slab_Solver.m` exactly (same hard cutoff there), and the reference
+  thesis text (Fig. 5.11's discussion) explicitly uses hitting this cutoff
+  as the model's *failure criterion*: "Failure is predicted to occur as
+  the principal concrete compressive stress in the outer layer reaches the
+  peak compressive strength... justified as no further states of
+  equilibrium can be found." A smoother softening branch would likely ease
+  Newton convergence right at that jump (same mechanism as the other
+  documented jumps), but would silently extend capacity past what the
+  reference defines as ultimate and would need re-validating against every
+  case that relies on this cutoff — considered and deliberately rejected
+  in this project; don't add one without re-opening that discussion.
