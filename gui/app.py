@@ -30,8 +30,9 @@ from shell_layer import (  # noqa: E402
     trace_path,
 )
 from shell_layer.crack_membrane import principal_strain  # noqa: E402
+from shell_layer.layers import discretize_concrete  # noqa: E402
 from shell_layer.materials.steel import steel_stress_tangent  # noqa: E402
-from shell_layer.reinforcement import crack_spacing  # noqa: E402
+from shell_layer.reinforcement import build_reinforcement_panels, crack_spacing  # noqa: E402
 from shell_layer.section import strain_at  # noqa: E402
 
 KPA_TO_NMM2 = 1e-3  # kN/m^2 -> N/mm^2
@@ -254,7 +255,7 @@ def shell_3d_figure(params: ShellParameters):
             dragmode="turntable",  # keeps z vertical on screen; 'orbit' lets it tumble
         ),
         margin=dict(l=0, r=0, t=10, b=0),
-        height=480,
+        height=400,
         showlegend=False,
     )
     return fig
@@ -266,6 +267,122 @@ SHELL_3D_CONFIG = dict(
     modeBarButtonsToRemove=["zoom3d", "pan3d", "orbitRotation", "resetCameraLastSave3d"],
     responsive=True,
 )
+
+
+def _elevation_x_half_extent(params: ShellParameters) -> float:
+    """The x-axis here is only for scale reference, not meant to show the
+    full 1m footprint - a small representative slice, wide enough to show
+    a couple of periods of whichever bar spacing is largest."""
+    spacings = [params.bottom_x.spacing, params.bottom_y.spacing, params.top_x.spacing, params.top_y.spacing]
+    return min(max(max(spacings) * 1.3, 150.0), 400.0)
+
+
+def _elevation_axes(fig: go.Figure, h_mm: float, x_half_extent: float) -> None:
+    """Shared x-right/z-down elevation axis setup. Deliberately NOT
+    aspect-locked (no scaleanchor): the x-axis only shows a small
+    reference slice (see _elevation_x_half_extent), not the true 1m
+    footprint, so a locked 1:1 aspect would force the z-axis into a
+    sliver too thin for the layer lines to read - letting z use the
+    plot's full height is what the x-axis-is-only-a-reference framing
+    calls for. z increases toward the bottom of the plot to match the
+    project's z-positive-downward convention (top face at the top of the
+    plot, bottom face at the bottom)."""
+    fig.update_xaxes(title="<i>x</i> [mm]", range=[-x_half_extent, x_half_extent],
+                      tickmode="array", tickvals=[-x_half_extent, 0, x_half_extent],
+                      ticktext=[f"{-x_half_extent:.0f}", "0", f"{x_half_extent:.0f}"],
+                      zeroline=False, showgrid=False)
+    fig.update_yaxes(title="<i>z</i> [mm]", range=[h_mm / 2 * 1.08, -h_mm / 2 * 1.08],
+                      tickmode="array", tickvals=[-h_mm / 2, 0, h_mm / 2], zeroline=False, showgrid=False)
+
+
+def concrete_discretization_figure(params: ShellParameters, n_layers: int) -> go.Figure:
+    """Elevation (x-z side view, no rebar): the concrete thickness split
+    into n_layers equal sub-layers, exactly as solve() discretizes it
+    (discretize_concrete) - each boundary drawn as a light-grey line."""
+    h_mm = params.thickness * 1000
+    layers = discretize_concrete(params.thickness, n_layers)
+    edges_mm = sorted({round((layer.z - layer.thickness / 2) * 1000, 6) for layer in layers} |
+                       {round((layer.z + layer.thickness / 2) * 1000, 6) for layer in layers})
+
+    fig = go.Figure()
+    fig.add_shape(type="rect", x0=-1000, y0=-h_mm / 2, x1=1000, y1=h_mm / 2, layer="below",
+                  fillcolor="seagreen", opacity=0.28, line=dict(color="white", width=1))
+    for edge in edges_mm:
+        fig.add_shape(type="line", x0=-1000, x1=1000, y0=edge, y1=edge, layer="above",
+                      line=dict(color="rgb(210,210,210)", width=1))
+
+    _elevation_axes(fig, h_mm, _elevation_x_half_extent(params))
+    fig.update_layout(
+        title=dict(text=f"Concrete discretisation ({n_layers} layers)", x=0.5, xanchor="center",
+                   font=dict(size=12)),
+        margin=dict(l=50, r=10, t=30, b=35), height=340, showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def sandwich_model_figure(params: ShellParameters) -> go.Figure:
+    """Elevation (x-z side view): the sandwich model's actual three bands
+    - top/bottom "reinforced cover element" (ReinforcementPanel.z/.thickness
+    - the zone the solver smears both bar directions into) in (faint)
+    concrete green, and the plain concrete core between them in light
+    grey, with no reinforcement. Within each cover band, the x-direction
+    bars (running along the view's own x-axis) are drawn as a horizontal
+    line, while the y-direction bars (running into/out of the page) are
+    drawn as dots at their real spacing - this is a real projection
+    difference, not an arbitrary style choice: a bar running in the
+    view's own plane reads as a line seen from the side, one running
+    perpendicular to it reads as a point seen end-on. A dashed line at
+    each panel's smeared depth (z_B/z_T) marks the single depth the
+    solver actually evaluates that panel's stress at - distinct from the
+    true individual bar depths the line/dots are drawn at."""
+    h_mm = params.thickness * 1000
+    bottom_panel, top_panel = build_reinforcement_panels(params)
+    depths = individual_bar_depths(params)
+    x_half_extent = _elevation_x_half_extent(params)
+
+    top_z0_mm, top_z1_mm = -h_mm / 2, -h_mm / 2 + top_panel.thickness * 1000
+    bot_z0_mm, bot_z1_mm = h_mm / 2 - bottom_panel.thickness * 1000, h_mm / 2
+
+    fig = go.Figure()
+    # Core first (light grey), then the two cover bands drawn on top so a
+    # thin/zero-thickness core at large cover doesn't get overpainted.
+    fig.add_shape(type="rect", x0=-1000, y0=top_z1_mm, x1=1000, y1=bot_z0_mm, layer="below",
+                  fillcolor="rgb(160,160,160)", opacity=0.5, line=dict(width=0))
+    for z0, z1 in ((top_z0_mm, top_z1_mm), (bot_z0_mm, bot_z1_mm)):
+        fig.add_shape(type="rect", x0=-1000, y0=z0, x1=1000, y1=z1, layer="below",
+                      fillcolor="seagreen", opacity=0.12, line=dict(color="white", width=1))
+    for panel_z_mm, label in ((top_panel.z * 1000, "z_T"), (bottom_panel.z * 1000, "z_B")):
+        fig.add_shape(type="line", x0=-1000, x1=1000, y0=panel_z_mm, y1=panel_z_mm, layer="above",
+                      line=dict(color="white", width=1, dash="dash"))
+        fig.add_annotation(x=-x_half_extent, y=panel_z_mm, text=label, showarrow=False,
+                           font=dict(size=9, color="white"), xanchor="left", yanchor="bottom", xshift=4)
+
+    # x-direction bars: lines (seen from the side, running along the plot's own x-axis).
+    for z_mm, diam_mm in ((depths.z_xB * 1000, params.bottom_x.bar_diameter),
+                          (depths.z_xT * 1000, params.top_x.bar_diameter)):
+        fig.add_shape(type="line", x0=-1000, x1=1000, y0=z_mm, y1=z_mm, layer="above",
+                      line=dict(color="royalblue", width=max(diam_mm / 3, 2)))
+    # y-direction bars: dots at their real spacing (seen end-on, into/out of the page).
+    for z_mm, spacing_mm, diam_mm in ((depths.z_yB * 1000, params.bottom_y.spacing, params.bottom_y.bar_diameter),
+                                       (depths.z_yT * 1000, params.top_y.spacing, params.top_y.bar_diameter)):
+        xs = bar_positions(spacing_mm) * 1000
+        fig.add_trace(go.Scatter(
+            x=xs, y=[z_mm] * len(xs), mode="markers",
+            marker=dict(size=max(diam_mm / 2.5, 6), color="royalblue", line=dict(color="white", width=0.8)),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    _elevation_axes(fig, h_mm, x_half_extent)
+    fig.update_layout(
+        title=dict(text="Sandwich model (cover elements + core)", x=0.5, xanchor="center", font=dict(size=12)),
+        margin=dict(l=50, r=10, t=30, b=35), height=340, showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+ELEVATION_CONFIG = dict(scrollZoom=False, displayModeBar=False, responsive=True)
 
 
 def bar_grid_shapes(layout_x: ReinforcementLayout, layout_y: ReinforcementLayout) -> list:
@@ -315,11 +432,18 @@ def crack_traces(theta1: float, s_rm0_mm: float, phase: float, extent: float = 5
 
 
 def plan_view_figure(title: str, layout_x: ReinforcementLayout, layout_y: ReinforcementLayout,
-                      cracked: bool, theta1: float, s_rm0_mm: float, phase: float) -> go.Figure:
+                      cracked: bool, theta1: float, s_rm0_mm: float, phase: float,
+                      biaxial: bool = False, s_rm0_mm2: float = None) -> go.Figure:
     """Plan view: concrete fill + reinforcement grid, same colours as the
-    3D view, with the crack pattern (if that face's panel is actually
-    cracked - see reinforcement.py's panel_response) drawn at the real
-    crack angle and spacing on top."""
+    3D view, with the crack pattern (if that face's outer concrete layer
+    is actually cracked - see crack_membrane.py's state classification)
+    drawn at the real crack angle and spacing on top. `biaxial` draws a
+    second, orthogonal crack family (State [5] in crack_membrane.py: both
+    principal strains exceed the cracking strain, not just eps1) using
+    `s_rm0_mm2` - the crack spacing recombined at the *other* angle, since
+    `crack_spacing()`'s x/y blend depends on the crack angle relative to
+    the reinforcement grid, not one direction-independent number.
+    """
     plan = go.Figure()
     plan.add_shape(type="rect", x0=-500, y0=-500, x1=500, y1=500, layer="below",
                     fillcolor="seagreen", opacity=0.28, line=dict(color="seagreen", width=1))
@@ -328,12 +452,21 @@ def plan_view_figure(title: str, layout_x: ReinforcementLayout, layout_y: Reinfo
     if cracked:
         for trace in crack_traces(theta1, s_rm0_mm, phase):
             plan.add_trace(trace)
+        if biaxial:
+            for trace in crack_traces(theta1 + math.pi / 2.0, s_rm0_mm2, phase + math.pi):
+                plan.add_trace(trace)
     plan.update_xaxes(title="<i>x</i> [mm]", range=[-520, 520], tickmode="array", tickvals=[-500, 0, 500],
                        zeroline=False, showgrid=False, scaleanchor="y", scaleratio=1, constrain="domain")
     plan.update_yaxes(title="<i>y</i> [mm]", range=[-520, 520], tickmode="array", tickvals=[-500, 0, 500],
                        zeroline=False, showgrid=False)
-    subtitle = (f" - θ={math.degrees(theta1) % 180:.0f}°, s_rm0={s_rm0_mm:.0f}mm" if cracked
-                else " - uncracked")
+    theta_deg = math.degrees(theta1) % 180
+    if not cracked:
+        subtitle = " - uncracked"
+    elif biaxial:
+        subtitle = (f" - biaxial: θ={theta_deg:.0f}°/{(theta_deg + 90) % 180:.0f}°, "
+                    f"s_rm0={s_rm0_mm:.0f}/{s_rm0_mm2:.0f}mm")
+    else:
+        subtitle = f" - θ={theta_deg:.0f}°, s_rm0={s_rm0_mm:.0f}mm"
     plan.update_layout(
         title=dict(text=title + subtitle, x=0.5, xanchor="center", font=dict(size=12)),
         margin=dict(l=50, r=10, t=32, b=40), height=300, showlegend=False,
@@ -673,7 +806,14 @@ with tab_single:
         st.error("Set a nonzero loading direction in the sidebar.")
     else:
         with st.expander("3D element geometry (live preview)", expanded=True):
-            st.plotly_chart(shell_3d_figure(params), width="stretch", config=SHELL_3D_CONFIG)
+            geo_col_3d, geo_col_elev1, geo_col_elev2 = st.columns([3, 2, 2])
+            with geo_col_3d:
+                st.plotly_chart(shell_3d_figure(params), width="stretch", config=SHELL_3D_CONFIG)
+            with geo_col_elev1:
+                st.plotly_chart(concrete_discretization_figure(params, n_concrete_layers),
+                                 width="stretch", config=ELEVATION_CONFIG)
+            with geo_col_elev2:
+                st.plotly_chart(sandwich_model_figure(params), width="stretch", config=ELEVATION_CONFIG)
 
         btn_col, status_col = st.columns([1, 4], vertical_alignment="center")
         with btn_col:
@@ -746,6 +886,14 @@ with tab_single:
             _, _, theta1_t = principal_strain(ex_t, ey_t, gxy_t)
             s_rm0_b = crack_spacing(section.bottom_panel.s_rm0_x, section.bottom_panel.s_rm0_y, theta1_b)
             s_rm0_t = crack_spacing(section.top_panel.s_rm0_x, section.top_panel.s_rm0_y, theta1_t)
+            # Second (orthogonal) family's spacing, for the plan view's biaxial
+            # crack pattern (State [5] in crack_membrane.py) - crack_spacing()'s
+            # x/y blend depends on angle relative to the reinforcement grid, so
+            # the 90°-rotated family needs its own recombination, not s_rm0_b/t.
+            s_rm0_b2 = crack_spacing(section.bottom_panel.s_rm0_x, section.bottom_panel.s_rm0_y,
+                                      theta1_b + math.pi / 2.0)
+            s_rm0_t2 = crack_spacing(section.top_panel.s_rm0_x, section.top_panel.s_rm0_y,
+                                      theta1_t + math.pi / 2.0)
             tau_b0 = 2.0 * concrete.fctm
             tau_b1 = concrete.fctm
 
@@ -818,26 +966,32 @@ with tab_single:
                                      width="stretch", config=CHAR_CONFIG)
 
             with st.expander("Crack orientation and spacing", expanded=True):
-                # Crack angle theta_top/theta_bottom is the concrete layer's
-                # own principal-strain direction (computed above from
-                # concrete_entries, matching how the reference figure
-                # defines it); crack spacing s_rm0_b/s_rm0_t and the cracked
-                # flag come from the reinforcement panel response instead
-                # (crack spacing and tension-stiffening onset are a
-                # reinforcement/TCM concept here, not a concrete one - see
-                # reinforcement.py). No cracks are drawn for a face whose
-                # panel hasn't actually cracked.
+                # Crack angle theta_top/theta_bottom, the cracked flag, and
+                # whether cracking is biaxial (State [5] in crack_membrane.py:
+                # both eps1 and eps2 exceed the cracking strain, not just
+                # eps1) all come from the SAME concrete outer-layer state
+                # object (sigma_c_bottom/sigma_c_top) for consistency - using
+                # the reinforcement panel's own cracked flag here (as before)
+                # would mix two independently-computed strain samples. Crack
+                # spacing s_rm0_b/s_rm0_t (and s_rm0_b2/s_rm0_t2 for the
+                # second, orthogonal family) still comes from the
+                # reinforcement panel instead (a TCM/bond concept, not a
+                # concrete one - see reinforcement.py).
+                bottom_biaxial = sigma_c_bottom.eps1 >= concrete.eps_cr and sigma_c_bottom.eps2 >= concrete.eps_cr
+                top_biaxial = sigma_c_top.eps1 >= concrete.eps_cr and sigma_c_top.eps2 >= concrete.eps_cr
                 plan_col1, plan_col2 = st.columns(2)
                 with plan_col1:
                     st.plotly_chart(
                         plan_view_figure("Plan view - slab bottom (inf)", bottom_x, bottom_y,
-                                          bottom_resp.cracked, theta_bottom, s_rm0_b, phase=0.0),
+                                          sigma_c_bottom.cracked, theta_bottom, s_rm0_b, phase=0.0,
+                                          biaxial=bottom_biaxial, s_rm0_mm2=s_rm0_b2),
                         width="stretch", config=PLAN_VIEW_CONFIG,
                     )
                 with plan_col2:
                     st.plotly_chart(
                         plan_view_figure("Plan view - slab top (sup)", top_x, top_y,
-                                          top_resp.cracked, theta_top, s_rm0_t, phase=1.7),
+                                          sigma_c_top.cracked, theta_top, s_rm0_t, phase=1.7,
+                                          biaxial=top_biaxial, s_rm0_mm2=s_rm0_t2),
                         width="stretch", config=PLAN_VIEW_CONFIG,
                     )
 
