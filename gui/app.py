@@ -5,13 +5,16 @@ Run with:
     streamlit run gui/app.py
 """
 
+import math
 import sys
 import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -32,6 +35,17 @@ from shell_layer.reinforcement import crack_spacing  # noqa: E402
 from shell_layer.section import strain_at  # noqa: E402
 
 KPA_TO_NMM2 = 1e-3  # kN/m^2 -> N/mm^2
+
+# Streamlit's default st.plotly_chart theming ("streamlit") repaints the
+# figure background to match the app's active theme (dark, in this
+# project's normal use) but leaves any colour set explicitly on a trace
+# alone - so plain "black" lines/markers/text vanish against that dark
+# background while unstyled axis titles/ticks (which the theme *does*
+# repaint) stay legible. Every custom trace/line/marker colour below is
+# chosen to read on a dark background; GREY_FILL is a solid mid-grey
+# (not the translucent black used originally) so the "grey infill" reads
+# as grey rather than fading into either a light or dark background.
+GREY_FILL = "rgba(160,160,160,0.35)"
 
 plt.rcParams.update({
     "mathtext.fontset": "cm",
@@ -64,6 +78,20 @@ _mathtext.MathTextParser.parse = _retrying_mathtext_parse
 
 st.set_page_config(page_title="shell_layer", layout="wide")
 st.markdown("<style>.block-container{padding-top:1.5rem;}</style>", unsafe_allow_html=True)
+
+# MathJax for Plotly's own LaTeX typesetting (legend/title text in $...$).
+# Earlier in this project's GUI work this was tried for the 3D scene
+# (gl3d) and never rendered - concluded to be a gl3d-specific limitation,
+# not a loading problem (see gui/prototype_3d_shell.py's docstring). These
+# are ordinary 2D Plotly charts, where Plotly's LaTeX support is actually
+# documented/expected to work, so it's worth the same injection here.
+# st.html(..., unsafe_allow_javascript=True) is required - script tags
+# inserted via st.markdown's innerHTML rendering never execute.
+st.html(
+    '<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js'
+    '?config=TeX-MML-AM_CHTML" type="text/javascript" async></script>',
+    unsafe_allow_javascript=True,
+)
 st.title("Layered RC shell element analysis")
 st.caption(
     "Analysis of reinforced concrete shell elements in a layered "
@@ -87,70 +115,247 @@ def rebar_input(direction: str, face: str, default_diam: float, default_spacing:
     return ReinforcementLayout(bar_diameter=diam, spacing=spacing)
 
 
-def crack_line_segments(theta1: float, n_lines: int = 7, size: float = 1.0):
-    """Parallel line segments representing cracks at principal-strain angle
-    `theta1` (cracks run perpendicular to the eps1/crack-normal direction),
-    long enough to cross a `size` x `size` square; the caller's fixed
-    axis limits crop them to the square.
-    """
-    phi = theta1 + np.pi / 2.0
-    dx, dy = np.cos(phi), np.sin(phi)
-    nx, ny = -dy, dx
-    length = size * 1.5
-    cx, cy = size / 2.0, size / 2.0
-    segments = []
-    for off in np.linspace(-size * 0.7, size * 0.7, n_lines):
-        px, py = cx + off * nx, cy + off * ny
-        segments.append(((px - dx * length, py - dy * length), (px + dx * length, py + dy * length)))
-    return segments
+def bar_positions(spacing_mm: float) -> np.ndarray:
+    """Bar centreline positions across the 1m footprint, centred, at the
+    given axis-to-axis spacing."""
+    spacing_m = spacing_mm / 1000.0
+    n = max(int(round(1.0 / spacing_m)), 1)
+    start = -0.5 + spacing_m / 2.0
+    positions = start + spacing_m * np.arange(n)
+    return positions[np.abs(positions) <= 0.5 + 1e-9]
 
 
-def plan_view_figure(params: ShellParameters, theta_bottom: float, theta_top: float):
-    """Schematic plan view: the bottom-face reinforcement grid (thin grey
-    lines, actual spacing) and the crack pattern implied by the bottom
-    layer's (solid) and top layer's (dotted) principal strain direction.
-    A single, cheap vector drawing - not meant to be a physically exact
-    rendering.
-    """
-    fig, ax = plt.subplots(figsize=(3.6, 3.6))
-    size = 1.0
-    ax.add_patch(plt.Rectangle((0, 0), size, size, fill=False, edgecolor="black", linewidth=1.0))
+def _tube_mesh(axis: str, along_pos: float, depth_z: float, radius_m: float, n_theta: int):
+    """Vertices + triangle indices for one straight rebar tube (2 rings, no
+    end caps). z is negated for display only (see shell_3d_figure) - data
+    stays in the project's real z-positive-downward convention until here."""
+    theta = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    if axis == "x":
+        x0 = np.full(n_theta, -0.5)
+        x1 = np.full(n_theta, 0.5)
+        y0 = y1 = along_pos + radius_m * cos_t
+        z0 = z1 = depth_z + radius_m * sin_t
+    else:
+        y0 = np.full(n_theta, -0.5)
+        y1 = np.full(n_theta, 0.5)
+        x0 = x1 = along_pos + radius_m * cos_t
+        z0 = z1 = depth_z + radius_m * sin_t
+    x = np.concatenate([x0, x1])
+    y = np.concatenate([y0, y1])
+    z = -np.concatenate([z0, z1])
+    idx = np.arange(n_theta)
+    idx_next = (idx + 1) % n_theta
+    i = np.concatenate([idx, idx_next])
+    j = np.concatenate([idx_next, n_theta + idx_next])
+    k = np.concatenate([n_theta + idx, n_theta + idx])
+    return x, y, z, i, j, k
 
-    sx = max(params.bottom_x.spacing / 1000.0, 1e-3)
-    sy = max(params.bottom_y.spacing / 1000.0, 1e-3)
-    for x in np.arange(sx / 2, size, sx):
-        ax.plot([x, x], [0, size], color="0.75", linewidth=0.6)
-    for y in np.arange(sy / 2, size, sy):
-        ax.plot([0, size], [y, y], color="0.75", linewidth=0.6)
 
-    for (x0, y0), (x1, y1) in crack_line_segments(theta_bottom, size=size):
-        ax.plot([x0, x1], [y0, y1], color="black", linewidth=1.1)
-    for (x0, y0), (x1, y1) in crack_line_segments(theta_top, size=size):
-        ax.plot([x0, x1], [y0, y1], color="black", linewidth=1.1, linestyle=":")
-
-    ax.set_xlim(0, size)
-    ax.set_ylim(0, size)
-    ax.set_aspect("equal")
-    ax.set_xlabel("$x$")
-    ax.set_ylabel("$y$")
-    ax.set_xticks([])
-    ax.set_yticks([])
-    theta_bottom_deg = np.degrees(theta_bottom) % 180
-    theta_top_deg = np.degrees(theta_top) % 180
-    ax.set_title(
-        rf"$\theta_{{r,\mathrm{{inf}}}}$={theta_bottom_deg:.0f}° (—)   "
-        rf"$\theta_{{r,\mathrm{{sup}}}}$={theta_top_deg:.0f}° (····)",
-        fontsize=8,
+@st.cache_data(show_spinner=False)
+def build_rebar_mesh(thickness_m: float, cover_m: float,
+                      bx_d: float, bx_s: float, by_d: float, by_s: float,
+                      tx_d: float, tx_s: float, ty_d: float, ty_s: float, n_theta: int = 8):
+    """All rebar tubes across all 4 layers, merged into ONE mesh (single
+    Mesh3d trace) - many separate per-bar traces made the figure rebuild
+    noticeably slow on every sidebar rerun."""
+    p = ShellParameters(
+        thickness=thickness_m, cover=cover_m,
+        bottom_x=ReinforcementLayout(bx_d, bx_s), bottom_y=ReinforcementLayout(by_d, by_s),
+        top_x=ReinforcementLayout(tx_d, tx_s), top_y=ReinforcementLayout(ty_d, ty_s),
     )
-    fig.tight_layout()
+    depths = individual_bar_depths(p)
+    layers = [
+        ("x", depths.z_xB, bx_s, bx_d), ("y", depths.z_yB, by_s, by_d),
+        ("x", depths.z_xT, tx_s, tx_d), ("y", depths.z_yT, ty_s, ty_d),
+    ]
+    xs, ys, zs, iis, jjs, kks = [], [], [], [], [], []
+    offset = 0
+    for axis, z, spacing, diam in layers:
+        for pos in bar_positions(spacing):
+            x, y, zz, i, j, k = _tube_mesh(axis, pos, z, diam / 2000.0, n_theta)
+            xs.append(x); ys.append(y); zs.append(zz)
+            iis.append(i + offset); jjs.append(j + offset); kks.append(k + offset)
+            offset += len(x)
+    return (np.concatenate(xs), np.concatenate(ys), np.concatenate(zs),
+            np.concatenate(iis), np.concatenate(jjs), np.concatenate(kks))
+
+
+def concrete_box_mesh(h: float) -> go.Mesh3d:
+    """Translucent green box, 1m x 1m footprint. Data z runs -h/2 (top) to
+    +h/2 (bottom); negated here for display so the top face plots at +h/2."""
+    xs = [-0.5, 0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5]
+    ys = [-0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, 0.5]
+    zs = [h / 2, h / 2, h / 2, h / 2, -h / 2, -h / 2, -h / 2, -h / 2]
+    i = [0, 0, 4, 4, 0, 0, 3, 3, 1, 1, 0, 0]
+    j = [1, 2, 5, 6, 1, 5, 2, 6, 2, 6, 3, 7]
+    k = [2, 3, 6, 7, 5, 4, 6, 7, 6, 5, 7, 4]
+    return go.Mesh3d(
+        x=xs, y=ys, z=zs, i=i, j=j, k=k,
+        color="seagreen", opacity=0.28, flatshading=True,
+        name="concrete", hoverinfo="skip", lighting=dict(ambient=0.6, diffuse=0.6),
+    )
+
+
+def axis_triad(h: float, length=0.18) -> list:
+    """Small x/y/z triad at the top face centre: x to the back-right, y
+    toward the viewer, z straight down through the box - matched against a
+    reference axonometric drawing, not re-derived from camera theory (see
+    shell_3d_figure)."""
+    ox, oy, oz = 0.0, 0.0, h / 2
+    specs = [("x", (length, 0, 0), "crimson"), ("y", (0, -length, 0), "darkorange"),
+             ("z", (0, 0, -length), "black")]
+    traces = []
+    for label, (dx, dy, dz), color in specs:
+        traces.append(go.Scatter3d(
+            x=[ox, ox + dx], y=[oy, oy + dy], z=[oz, oz + dz],
+            mode="lines+text", line=dict(color=color, width=6),
+            text=["", label], textposition="top center",
+            showlegend=False, hoverinfo="skip",
+        ))
+    return traces
+
+
+def shell_3d_figure(params: ShellParameters):
+    """Interactive 3D geometry preview - translucent concrete box, blue
+    rebar tubes at their true individual depths, small coordinate triad.
+    Pure function of the sidebar geometry inputs, no solve() involved, so
+    it costs nothing in analysis time and updates live as the sidebar
+    changes. See prototype gui/prototype_3d_shell.py for the full design
+    history (camera choice, LaTeX-in-gl3d limitation, turntable quirks)."""
+    h = params.thickness
+    rx, ry, rz, ri, rj, rk = build_rebar_mesh(
+        params.thickness, params.cover,
+        params.bottom_x.bar_diameter, params.bottom_x.spacing,
+        params.bottom_y.bar_diameter, params.bottom_y.spacing,
+        params.top_x.bar_diameter, params.top_x.spacing,
+        params.top_y.bar_diameter, params.top_y.spacing,
+    )
+    rebar_mesh = go.Mesh3d(
+        x=rx, y=ry, z=rz, i=ri, j=rj, k=rk,
+        color="royalblue", flatshading=True, name="rebar", hoverinfo="skip",
+        lighting=dict(ambient=0.5, diffuse=0.7, specular=0.3),
+    )
+    fig = go.Figure(data=[concrete_box_mesh(h), rebar_mesh] + axis_triad(h))
+
+    camera = dict(up=dict(x=0, y=0, z=1), eye=dict(x=1.4, y=1.4, z=1.15), center=dict(x=0, y=0, z=0))
+    half_h_mm = h / 2 * 1000
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(title="<i>x</i> [mm]", tickmode="array", tickvals=[-0.5, 0, 0.5],
+                        ticktext=["-500", "0", "500"]),
+            yaxis=dict(title="<i>y</i> [mm]", tickmode="array", tickvals=[-0.5, 0, 0.5],
+                        ticktext=["-500", "0", "500"]),
+            zaxis=dict(title="<i>z</i> [mm]", tickmode="array", tickvals=[-h / 2, 0, h / 2],
+                        ticktext=[f"{half_h_mm:.0f}", "0", f"{-half_h_mm:.0f}"]),
+            aspectmode="manual",
+            aspectratio=dict(x=1, y=1, z=max(h / 1.0, 0.15)),
+            camera=camera,
+            dragmode="turntable",  # keeps z vertical on screen; 'orbit' lets it tumble
+        ),
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=480,
+        showlegend=False,
+    )
     return fig
+
+
+SHELL_3D_CONFIG = dict(
+    scrollZoom=False,
+    displayModeBar=True,
+    modeBarButtonsToRemove=["zoom3d", "pan3d", "orbitRotation", "resetCameraLastSave3d"],
+    responsive=True,
+)
+
+
+def bar_grid_shapes(layout_x: ReinforcementLayout, layout_y: ReinforcementLayout) -> list:
+    """Plan-view rebar grid: x-direction bars as horizontal lines (spaced
+    along y), y-direction bars as vertical lines (spaced along x); 'below'
+    layer so the crack-pattern traces added on top of these shapes stay
+    the topmost layer (Plotly shapes default above traces otherwise)."""
+    shapes = []
+    for pos in bar_positions(layout_x.spacing):
+        y = pos * 1000
+        shapes.append(dict(type="line", x0=-500, x1=500, y0=y, y1=y, layer="below",
+                            line=dict(color="royalblue", width=max(layout_x.bar_diameter / 3, 1.5))))
+    for pos in bar_positions(layout_y.spacing):
+        x = pos * 1000
+        shapes.append(dict(type="line", y0=-500, y1=500, x0=x, x1=x, layer="below",
+                            line=dict(color="royalblue", width=max(layout_y.bar_diameter / 3, 1.5))))
+    return shapes
+
+
+def crack_traces(theta1: float, s_rm0_mm: float, phase: float, extent: float = 500.0,
+                  amplitude: float = 10.0, wavelength: float = 120.0) -> list:
+    """White crack lines, running perpendicular to the eps1/crack-normal
+    direction theta1 (matching the reference figure's convention), spaced
+    at the real stabilized crack spacing s_rm0 - not an illustrative fixed
+    count. The small sinusoidal wiggle is a stylistic touch only (real
+    cracks meander); it carries no physical meaning of its own."""
+    phi = theta1 + math.pi / 2.0
+    dirx, diry = math.cos(phi), math.sin(phi)
+    perp_x, perp_y = -diry, dirx
+    spacing = max(s_rm0_mm, 15.0)
+    n_side = int(min(math.ceil(extent / spacing), 25))  # cap: avoid clutter at very tight spacing
+    offsets = np.arange(-n_side, n_side + 1) * spacing
+    s = np.linspace(-extent * 1.5, extent * 1.5, 240)
+    traces = []
+    for k, offset in enumerate(offsets):
+        wig = amplitude * np.sin(2 * np.pi * s / wavelength + phase + k)
+        x = offset * perp_x + s * dirx + wig * perp_x
+        y = offset * perp_y + s * diry + wig * perp_y
+        mask = (np.abs(x) <= extent) & (np.abs(y) <= extent)
+        if not mask.any():
+            continue
+        traces.append(go.Scatter(
+            x=x[mask], y=y[mask], mode="lines",
+            line=dict(color="white", width=2.0), hoverinfo="skip", showlegend=False,
+        ))
+    return traces
+
+
+def plan_view_figure(title: str, layout_x: ReinforcementLayout, layout_y: ReinforcementLayout,
+                      cracked: bool, theta1: float, s_rm0_mm: float, phase: float) -> go.Figure:
+    """Plan view: concrete fill + reinforcement grid, same colours as the
+    3D view, with the crack pattern (if that face's panel is actually
+    cracked - see reinforcement.py's panel_response) drawn at the real
+    crack angle and spacing on top."""
+    plan = go.Figure()
+    plan.add_shape(type="rect", x0=-500, y0=-500, x1=500, y1=500, layer="below",
+                    fillcolor="seagreen", opacity=0.28, line=dict(color="seagreen", width=1))
+    for shape in bar_grid_shapes(layout_x, layout_y):
+        plan.add_shape(**shape)
+    if cracked:
+        for trace in crack_traces(theta1, s_rm0_mm, phase):
+            plan.add_trace(trace)
+    plan.update_xaxes(title="<i>x</i> [mm]", range=[-520, 520], tickmode="array", tickvals=[-500, 0, 500],
+                       zeroline=False, showgrid=False, scaleanchor="y", scaleratio=1, constrain="domain")
+    plan.update_yaxes(title="<i>y</i> [mm]", range=[-520, 520], tickmode="array", tickvals=[-500, 0, 500],
+                       zeroline=False, showgrid=False)
+    subtitle = (f" - θ={math.degrees(theta1) % 180:.0f}°, s_rm0={s_rm0_mm:.0f}mm" if cracked
+                else " - uncracked")
+    plan.update_layout(
+        title=dict(text=title + subtitle, x=0.5, xanchor="center", font=dict(size=12)),
+        margin=dict(l=50, r=10, t=32, b=40), height=300, showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return plan
+
+
+PLAN_VIEW_CONFIG = dict(scrollZoom=False, displayModeBar=False, responsive=True)
 
 
 def cross_section_figure(section: LayeredSection, eps0: np.ndarray, kappa: np.ndarray):
     """The 5 through-thickness subplots: eps1, eps2, theta_r, principal
     concrete stress (+ softened peak envelope), and reinforcement stress at
     each bar's true individual depth - matching the reference figure's
-    layout, notation and grey-fill style.
+    layout and grey-fill style, but plotted with Plotly (not matplotlib
+    LaTeX mathtext, which was the main cost of loading this figure - see
+    README/CLAUDE.md) so every point is hoverable. Axis labels use Plotly's
+    native <sub>/<sup> tag support + literal Greek Unicode instead of
+    LaTeX - gl3d scenes proved not to support MathJax typesetting earlier
+    in this project's GUI work, and 2D Plotly LaTeX still needs the same
+    external MathJax script; native tags avoid that dependency entirely.
     """
     F, layer_data = section.internal_forces(eps0, kappa)
     concrete_entries = [(z, state) for kind, z, state in layer_data if kind == "concrete"]
@@ -173,74 +378,93 @@ def cross_section_figure(section: LayeredSection, eps0: np.ndarray, kappa: np.nd
         section.params.bottom_x.bar_diameter, section.params.bottom_y.bar_diameter,
         section.params.top_x.bar_diameter, section.params.top_y.bar_diameter,
     ])
+    bar_labels = ["x,inf", "y,inf", "x,sup", "y,sup"]
 
-    fig, axes = plt.subplots(1, 5, figsize=(15, 5), sharey=True)
+    fig = make_subplots(rows=1, cols=5, shared_yaxes=True, horizontal_spacing=0.025,
+                         subplot_titles=["ε₁", "ε₂", "θ<sub>r</sub>", "σ<sub>c1r</sub>, σ<sub>c2r</sub>",
+                                          "σ<sub>sr</sub>"])
 
-    ax = axes[0]
-    ax.fill_betweenx(z_mm, 0, eps1, color="black", alpha=0.15, linewidth=0)
-    ax.plot(eps1, z_mm, "-", color="black", label=r"$\varepsilon_1$")
-    ax.axvline(0, color="black", linewidth=0.6)
-    ax.set_xlabel(r"$\varepsilon_1$ [‰]")
-    ax.set_ylabel(r"$z$ [mm]")
-    ax.set_title(r"$\varepsilon_1$")
+    def fill_line(x, y, col, hover_label, unit, fmt=".3f"):
+        fig.add_trace(go.Scatter(
+            x=x, y=y, mode="lines", line=dict(color="white", width=1.3),
+            fill="tozerox", fillcolor=GREY_FILL, showlegend=False,
+            hovertemplate=f"z=%{{y:.0f}} mm<br>{hover_label}=%{{x:{fmt}}}{unit}<extra></extra>",
+        ), row=1, col=col)
 
-    ax = axes[1]
-    ax.fill_betweenx(z_mm, 0, eps2, color="black", alpha=0.15, linewidth=0)
-    ax.plot(eps2, z_mm, "-", color="black", label=r"$\varepsilon_2$")
-    ax.axvline(0, color="black", linewidth=0.6)
-    ax.set_xlabel(r"$\varepsilon_2$ [‰]")
-    ax.set_title(r"$\varepsilon_2$")
+    fill_line(eps1, z_mm, 1, "ε₁", "‰")
+    fill_line(eps2, z_mm, 2, "ε₂", "‰")
+    fill_line(theta_deg, z_mm, 3, "θ_r", "°", fmt=".1f")
 
-    ax = axes[2]
-    ax.fill_betweenx(z_mm, 0, theta_deg, color="black", alpha=0.15, linewidth=0)
-    ax.plot(theta_deg, z_mm, "-", color="black")
-    ax.set_xlim(0, 180)
-    ax.set_xticks([0, 90, 180])
-    ax.set_xlabel(r"$\theta_r$ [°]")
-    ax.set_title(r"$\theta_r$")
+    fig.add_trace(go.Scatter(
+        x=sigma_c2, y=z_mm, mode="lines", line=dict(color="white", width=1.3),
+        fill="tozerox", fillcolor=GREY_FILL, name=r"$\sigma_{c2r}$",
+        hovertemplate="z=%{y:.0f} mm<br>σ_c2r=%{x:.2f} N/mm²<extra></extra>",
+    ), row=1, col=4)
+    fig.add_trace(go.Scatter(
+        x=sigma_c1, y=z_mm, mode="lines", line=dict(color="rgb(190,190,190)", width=1.3), name=r"$\sigma_{c1r}$",
+        hovertemplate="z=%{y:.0f} mm<br>σ_c1r=%{x:.2f} N/mm²<extra></extra>",
+    ), row=1, col=4)
+    fig.add_trace(go.Scatter(
+        x=-f_c, y=z_mm, mode="lines", line=dict(color="white", width=1.0, dash="dashdot"), name=r"$f_c$",
+        hovertemplate="z=%{y:.0f} mm<br>f_c=%{x:.2f} N/mm²<extra></extra>",
+    ), row=1, col=4)
+    fig.add_trace(go.Scatter(
+        x=[section.concrete.fctm] * 2, y=[h_mm / 2, -h_mm / 2], mode="lines",
+        line=dict(color="rgb(180,180,180)", width=0.9, dash="dash"), name=r"$f_{ctm}$", hoverinfo="skip",
+    ), row=1, col=4)
 
-    ax = axes[3]
-    ax.fill_betweenx(z_mm, 0, sigma_c2, color="0.5", alpha=0.35, linewidth=0)
-    ax.plot(sigma_c2, z_mm, "-", color="black", label=r"$\sigma_{c2r}$")
-    ax.plot(sigma_c1, z_mm, "-", color="0.55", label=r"$\sigma_{c1r}$")
-    ax.plot(-f_c, z_mm, "-.", color="black", linewidth=0.8, label=r"$f_c$")
-    ax.axvline(section.concrete.fctm, color="0.4", linewidth=0.7, linestyle="--", label=r"$f_{ctm}$")
-    ax.axvline(0, color="black", linewidth=0.6)
-    ax.set_xlabel(r"$\sigma_{cr}$ [N/mm²]")
-    ax.legend(fontsize=7, loc="lower left")
-    ax.set_title(r"$\sigma_{c1r},\ \sigma_{c2r}$")
+    # Same grey as the concrete stress fill (GREY_FILL), not a separate
+    # opaque grey, so the two stress panels read as one consistent style.
+    fig.add_trace(go.Bar(
+        x=bar_sigma, y=bar_z_mm, orientation="h", width=np.maximum(bar_diam_mm, 4.0),
+        marker=dict(color=GREY_FILL, line=dict(color="white", width=0.7)), showlegend=False,
+        text=bar_labels, hovertemplate="%{text}<br>σ_s=%{x:.1f} N/mm²<extra></extra>",
+    ), row=1, col=5)
+    for z, sigma, label in zip(bar_z_mm, bar_sigma, bar_labels):
+        fig.add_annotation(x=sigma, y=z, text=label, showarrow=False, font=dict(size=9, color="white"),
+                            xanchor="left" if sigma >= 0 else "right",
+                            xshift=6 if sigma >= 0 else -6, row=1, col=5)
 
-    ax = axes[4]
-    ax.barh(bar_z_mm, bar_sigma, height=np.maximum(bar_diam_mm, 4.0), color="0.75",
-            edgecolor="black", linewidth=0.6)
     # Fix the x-range from the bar data alone (padded) *before* drawing the
-    # fy/fu reference lines - axvline would otherwise stretch the autoscale
+    # fy/fu reference lines - an autoscaled range would otherwise stretch
     # out to +-fu even when actual stresses are a small fraction of yield,
     # making the bars themselves nearly invisible for lightly-loaded cases.
     data_max = max(float(np.max(np.abs(bar_sigma))), 1.0) * 1.6
-    ax.set_xlim(-data_max, data_max)
-    ax.axvline(0, color="black", linewidth=0.6)
+    fig.update_xaxes(range=[-data_max, data_max], row=1, col=5)
     if data_max > section.steel.fy * 0.5:
-        ax.axvline(section.steel.fy, color="0.4", linewidth=0.7, linestyle="--", label=r"$f_{sy}$")
-        ax.axvline(-section.steel.fy, color="0.4", linewidth=0.7, linestyle="--")
+        for sign, show in ((1, True), (-1, False)):
+            fig.add_trace(go.Scatter(
+                x=[sign * section.steel.fy] * 2, y=[h_mm / 2, -h_mm / 2], mode="lines",
+                line=dict(color="rgb(180,180,180)", width=0.9, dash="dash"),
+                name=r"$f_{sy}$", showlegend=show, hoverinfo="skip",
+            ), row=1, col=5)
     if data_max > section.steel.fu * 0.5:
-        ax.axvline(section.steel.fu, color="0.2", linewidth=0.7, linestyle=":", label=r"$f_{su}$")
-        ax.axvline(-section.steel.fu, color="0.2", linewidth=0.7, linestyle=":")
-    for z, sigma, label in zip(bar_z_mm, bar_sigma, ["$x,\\mathrm{inf}$", "$y,\\mathrm{inf}$",
-                                                      "$x,\\mathrm{sup}$", "$y,\\mathrm{sup}$"]):
-        ax.annotate(label, (sigma, z), textcoords="offset points",
-                    xytext=(6 if sigma >= 0 else -6, 0),
-                    ha="left" if sigma >= 0 else "right", va="center", fontsize=6)
-    ax.set_xlabel(r"$\sigma_{sr}$ [N/mm²]")
-    if data_max > section.steel.fy * 0.5:
-        ax.legend(fontsize=7, loc="lower right")
-    ax.set_title(r"$\sigma_{sr}$")
+        for sign, show in ((1, True), (-1, False)):
+            fig.add_trace(go.Scatter(
+                x=[sign * section.steel.fu] * 2, y=[h_mm / 2, -h_mm / 2], mode="lines",
+                line=dict(color="rgb(230,230,230)", width=0.9, dash="dot"),
+                name=r"$f_{su}$", showlegend=show, hoverinfo="skip",
+            ), row=1, col=5)
 
-    for ax in axes:
-        ax.set_ylim(h_mm / 2, -h_mm / 2)  # z positive downward: top of plot = top face
-        ax.grid(True, linewidth=0.3)
+    fig.update_xaxes(title_text="ε₁ [‰]", row=1, col=1)
+    fig.update_xaxes(title_text="ε₂ [‰]", row=1, col=2)
+    fig.update_xaxes(title_text="θ<sub>r</sub> [°]", range=[0, 180], tickvals=[0, 90, 180], row=1, col=3)
+    fig.update_xaxes(title_text="σ<sub>c1r</sub>, σ<sub>c2r</sub> [N/mm²]", row=1, col=4)
+    fig.update_xaxes(title_text="σ<sub>sr</sub> [N/mm²]", row=1, col=5)
+    fig.update_yaxes(title_text="z [mm]", row=1, col=1)
+    fig.update_yaxes(range=[h_mm / 2, -h_mm / 2])  # z positive downward: top of plot = top face
+    for c in range(1, 6):
+        fig.add_vline(x=0, line_width=0.6, line_color="white", row=1, col=c)
 
-    fig.tight_layout()
+    # Outer border box around each subplot - showline draws it, mirror
+    # puts it on all four sides instead of just the near one.
+    fig.update_xaxes(showline=True, linecolor="white", linewidth=1, mirror=True)
+    fig.update_yaxes(showline=True, linecolor="white", linewidth=1, mirror=True)
+
+    fig.update_layout(
+        height=480, margin=dict(l=55, r=20, t=35, b=45),
+        legend=dict(font=dict(size=10), orientation="h", yanchor="bottom", y=-0.28, x=0.5, xanchor="center"),
+    )
     return fig
 
 
@@ -264,36 +488,47 @@ def convergence_figure(history: list):
     return fig
 
 
+CHAR_CONFIG = dict(scrollZoom=False, displayModeBar=False, responsive=True)
+
+
 def steel_characteristic_figure(curves: list, eps_max_permil: float):
     """Each bar's own operative stress-strain curve (bare bilinear - solid
-    black - or TCM - dotted black - if tension stiffening is on *and* that
+    white - or TCM - dotted white - if tension stiffening is on *and* that
     bar's panel is actually cracked, matching exactly what governs its real
     response, not a generic reference curve) with the analysis's resulting
-    (mean strain, stress) point marked on it. Tensile quadrant only
-    (eps_m >= 0). `curves`: list of (label, eps_range_permil, sigma_range,
-    point_eps_permil, point_sigma, is_tcm). Markers are drawn in a second
-    pass, after every curve, so they sit on top of all lines regardless of
-    draw order; white fill with a black edge, one marker shape per bar
-    (curves no longer being individually colored), keeps them legible.
+    (mean strain, stress) point marked on it and hoverable. Tensile
+    quadrant only (eps_m >= 0). `curves`: list of (label, eps_range_permil,
+    sigma_range, point_eps_permil, point_sigma, is_tcm). Markers are added
+    in a second pass, after every curve, so they sit on top of all lines
+    regardless of draw order; white fill with a black edge, one marker
+    shape per bar, keeps them legible against either a light or dark
+    background (see GREY_FILL's comment for why white/light colours are
+    used throughout these figures instead of black).
     """
-    fig, ax = plt.subplots(figsize=(5.5, 3.2))
-    marker_shapes = ["o", "s", "^", "D"]
-    to_mark = []
-    for (label, eps_range, sigma_range, point_eps, point_sigma, is_tcm), marker in zip(curves, marker_shapes):
-        linestyle = ":" if is_tcm else "-"
-        ax.plot(eps_range, sigma_range, linestyle, color="black", linewidth=1.0, label=label, zorder=2)
-        to_mark.append((marker, point_eps, point_sigma))
-    for marker, point_eps, point_sigma in to_mark:
-        ax.plot(point_eps, point_sigma, marker, markersize=6.5, markerfacecolor="white",
-                 markeredgecolor="black", markeredgewidth=1.4, zorder=5)
-    ax.axhline(0, color="black", linewidth=0.5)
-    ax.set_xlim(0, eps_max_permil)
-    ax.set_xlabel(r"$\varepsilon_{sm}$ [‰]")
-    ax.set_ylabel(r"$\sigma_s$ [N/mm²]")
-    ax.set_title("Reinforcing steel (tensile quadrant)", fontsize=9)
-    ax.legend(fontsize=6, loc="best")
-    ax.grid(True, linewidth=0.3)
-    fig.tight_layout()
+    fig = go.Figure()
+    marker_shapes = ["circle", "square", "triangle-up", "diamond"]
+    for (label, eps_range, sigma_range, _point_eps, _point_sigma, is_tcm) in curves:
+        fig.add_trace(go.Scatter(
+            x=eps_range, y=sigma_range, mode="lines",
+            line=dict(color="white", width=1.2, dash="dot" if is_tcm else "solid"),
+            name=label, hovertemplate=f"{label}<br>ε=%{{x:.3f}}‰<br>σ=%{{y:.1f}} N/mm²<extra></extra>",
+        ))
+    for (label, _eps_range, _sigma_range, point_eps, point_sigma, _is_tcm), shape in zip(curves, marker_shapes):
+        fig.add_trace(go.Scatter(
+            x=[point_eps], y=[point_sigma], mode="markers",
+            marker=dict(symbol=shape, size=10, color="white", line=dict(color="black", width=1.6)),
+            showlegend=False,
+            hovertemplate=f"{label} (result)<br>ε_sm=%{{x:.3f}}‰<br>σ_s=%{{y:.1f}} N/mm²<extra></extra>",
+        ))
+    fig.add_hline(y=0, line_width=0.6, line_color="white")
+    fig.update_xaxes(title="ε<sub>sm</sub> [‰]", range=[0, eps_max_permil],
+                      showline=True, linecolor="white", linewidth=1, mirror=True)
+    fig.update_yaxes(title="σ<sub>s</sub> [N/mm²]",
+                      showline=True, linecolor="white", linewidth=1, mirror=True)
+    fig.update_layout(
+        title=dict(text="Reinforcing steel (tensile quadrant)", font=dict(size=13), x=0.5, xanchor="center"),
+        height=380, margin=dict(l=60, r=20, t=40, b=45), legend=dict(font=dict(size=10)),
+    )
     return fig
 
 
@@ -320,31 +555,40 @@ def concrete_characteristic_figure(concrete: ConcreteMaterial, layers: list, eps
     eps_mag = np.linspace(0, eps_max_permil, 300)  # displayed magnitude, = -eps
     eps_actual = -eps_mag
 
-    fig, ax = plt.subplots(figsize=(5.5, 3.2))
-    linestyles = ["-", "--"]
-    point_markers = {"c1": "o", "c2": "s"}
+    fig = go.Figure()
+    dash_styles = ["solid", "dash"]
+    point_markers = {"c1": "circle", "c2": "square"}
 
-    for (layer_label, eps1, sigma1, eps2, sigma2), linestyle in zip(layers, linestyles):
+    for (layer_label, eps1, sigma1, eps2, sigma2), dash in zip(layers, dash_styles):
         eps1_actual = eps1 / 1000.0
         f_c = concrete.peak_compressive_stress(eps1_actual) if eps1_actual >= 0 else concrete.fck
         sigma_actual = f_c * (eps_actual**2 + 2 * eps_actual * eps_c0_permil) / eps_c0_permil**2
         sigma_actual = np.where(eps_actual < -eps_c0_permil, 0.0, sigma_actual)
-        ax.plot(eps_mag, -sigma_actual, linestyle, color="black", linewidth=1.0,
-                label=f"{layer_label} (adapted)", zorder=2)
-        for comp_label, eps, sigma in ((r"$c1,\mathrm{%s}$" % layer_label, eps1, sigma1),
-                                        (r"$c2,\mathrm{%s}$" % layer_label, eps2, sigma2)):
-            marker = point_markers["c1" if "c1" in comp_label else "c2"]
-            ax.plot(-eps, -sigma, marker, markersize=6.5, markerfacecolor="white",
-                     markeredgecolor="black", markeredgewidth=1.4, label=comp_label, zorder=5)
+        fig.add_trace(go.Scatter(
+            x=eps_mag, y=-sigma_actual, mode="lines", line=dict(color="white", width=1.2, dash=dash),
+            name=rf"$\mathrm{{{layer_label}}}\ (\mathrm{{adapted}})$",
+            hovertemplate=f"{layer_label}<br>-ε_c=%{{x:.3f}}‰<br>-σ_c=%{{y:.2f}} N/mm²<extra></extra>",
+        ))
+        for comp_label, eps, sigma, marker_key in (
+            (f"c1,{layer_label}", eps1, sigma1, "c1"), (f"c2,{layer_label}", eps2, sigma2, "c2"),
+        ):
+            fig.add_trace(go.Scatter(
+                x=[-eps], y=[-sigma], mode="markers",
+                marker=dict(symbol=point_markers[marker_key], size=10, color="white",
+                            line=dict(color="black", width=1.6)),
+                name=rf"${marker_key},\mathrm{{{layer_label}}}$",
+                hovertemplate=f"{comp_label}<br>-ε=%{{x:.3f}}‰<br>-σ=%{{y:.2f}} N/mm²<extra></extra>",
+            ))
 
-    ax.axhline(0, color="black", linewidth=0.5)
-    ax.set_xlim(0, eps_max_permil)
-    ax.set_xlabel(r"$-\varepsilon_c$ [‰]")
-    ax.set_ylabel(r"$-\sigma_c$ [N/mm²]")
-    ax.set_title("Concrete (compressive quadrant)", fontsize=9)
-    ax.legend(fontsize=6, loc="best")
-    ax.grid(True, linewidth=0.3)
-    fig.tight_layout()
+    fig.add_hline(y=0, line_width=0.6, line_color="white")
+    fig.update_xaxes(title="-ε<sub>c</sub> [‰]", range=[0, eps_max_permil],
+                      showline=True, linecolor="white", linewidth=1, mirror=True)
+    fig.update_yaxes(title="-σ<sub>c</sub> [N/mm²]",
+                      showline=True, linecolor="white", linewidth=1, mirror=True)
+    fig.update_layout(
+        title=dict(text="Concrete (compressive quadrant)", font=dict(size=13), x=0.5, xanchor="center"),
+        height=380, margin=dict(l=60, r=20, t=40, b=45), legend=dict(font=dict(size=10)),
+    )
     return fig
 
 
@@ -428,6 +672,9 @@ with tab_single:
     if direction_norm == 0:
         st.error("Set a nonzero loading direction in the sidebar.")
     else:
+        with st.expander("3D element geometry (live preview)", expanded=True):
+            st.plotly_chart(shell_3d_figure(params), width="stretch", config=SHELL_3D_CONFIG)
+
         btn_col, status_col = st.columns([1, 4], vertical_alignment="center")
         with btn_col:
             run = st.button("Run analysis", type="primary")
@@ -481,34 +728,10 @@ with tab_single:
             theta_top = concrete_entries[0][1].theta1
             theta_bottom = concrete_entries[-1][1].theta1
 
-            st.latex(
-                r"[\varepsilon_{x,0},\ \varepsilon_{y,0},\ \gamma_{xy,0}]="
-                r"[%.4f,\ %.4f,\ %.4f]\text{‰}"
-                r"\qquad"
-                r"[\kappa_{x},\ \kappa_{y},\ \kappa_{xy}]="
-                r"[%.4f,\ %.4f,\ %.4f]\,\text{mrad/m}"
-                % (tuple(v * 1000 for v in result.eps0) + tuple(v * 1000 for v in result.kappa))
-            )
-
-            st.pyplot(cross_section_figure(section, result.eps0, result.kappa))
-
             bottom_resp = next(state for kind, z, state in layer_data if kind == "reinforcement" and z > 0)
             top_resp = next(state for kind, z, state in layer_data if kind == "reinforcement" and z < 0)
             sigma_c_bottom = concrete_entries[-1][1]
             sigma_c_top = concrete_entries[0][1]
-
-            st.latex(
-                r"[\sigma_{sx,\mathrm{inf}},\ \sigma_{sy,\mathrm{inf}},\ "
-                r"\sigma_{sx,\mathrm{sup}},\ \sigma_{sy,\mathrm{sup}}]="
-                r"[%.1f,\ %.1f,\ %.1f,\ %.1f]\,\text{N/mm}^2"
-                % (bottom_resp.sigma_x, bottom_resp.sigma_y, top_resp.sigma_x, top_resp.sigma_y)
-            )
-            st.latex(
-                r"[\sigma_{c1,\mathrm{inf}},\ \sigma_{c2,\mathrm{inf}},\ "
-                r"\sigma_{c1,\mathrm{sup}},\ \sigma_{c2,\mathrm{sup}}]="
-                r"[%.2f,\ %.2f,\ %.2f,\ %.2f]\,\text{N/mm}^2"
-                % (sigma_c_bottom.sigma1, sigma_c_bottom.sigma2, sigma_c_top.sigma1, sigma_c_top.sigma2)
-            )
 
             # Steel: each bar's own operative curve - bare bilinear, or TCM
             # (with that bar's real diameter and its panel's real crack
@@ -561,24 +784,69 @@ with tab_single:
                 max(abs(eps) for _lbl, eps1, _s1, eps2, _s2 in concrete_layers for eps in (eps1, eps2)) * 1.3,
             )
 
-            char_col1, char_col2 = st.columns(2)
-            with char_col1:
-                st.pyplot(steel_characteristic_figure(steel_curves, eps_max_steel))
-            with char_col2:
-                st.pyplot(concrete_characteristic_figure(concrete, concrete_layers, eps_max_concrete))
+            with st.expander("Resulting strain and stress state", expanded=True):
+                st.latex(
+                    r"[\varepsilon_{x,0},\ \varepsilon_{y,0},\ \gamma_{xy,0}]="
+                    r"[%.4f,\ %.4f,\ %.4f]\text{‰}"
+                    r"\qquad"
+                    r"[\kappa_{x},\ \kappa_{y},\ \kappa_{xy}]="
+                    r"[%.4f,\ %.4f,\ %.4f]\,\text{mrad/m}"
+                    % (tuple(v * 1000 for v in result.eps0) + tuple(v * 1000 for v in result.kappa))
+                )
+                st.latex(
+                    r"[\sigma_{sx,\mathrm{inf}},\ \sigma_{sy,\mathrm{inf}},\ "
+                    r"\sigma_{sx,\mathrm{sup}},\ \sigma_{sy,\mathrm{sup}}]="
+                    r"[%.1f,\ %.1f,\ %.1f,\ %.1f]\,\text{N/mm}^2"
+                    % (bottom_resp.sigma_x, bottom_resp.sigma_y, top_resp.sigma_x, top_resp.sigma_y)
+                )
+                st.latex(
+                    r"[\sigma_{c1,\mathrm{inf}},\ \sigma_{c2,\mathrm{inf}},\ "
+                    r"\sigma_{c1,\mathrm{sup}},\ \sigma_{c2,\mathrm{sup}}]="
+                    r"[%.2f,\ %.2f,\ %.2f,\ %.2f]\,\text{N/mm}^2"
+                    % (sigma_c_bottom.sigma1, sigma_c_bottom.sigma2, sigma_c_top.sigma1, sigma_c_top.sigma2)
+                )
+                st.plotly_chart(cross_section_figure(section, result.eps0, result.kappa),
+                                 width="stretch", config=dict(responsive=True))
 
-            # Plan view (crack pattern) and convergence plots: reported not
-            # rendering correctly for the user - disabled rather than
-            # deleted, pending further investigation. plan_view_figure /
-            # convergence_figure / the theta_top/theta_bottom computation
-            # above and the `history` list collected from solve() are all
-            # still intact and ready to re-enable.
-            # bottom_col1, bottom_col2 = st.columns(2)
-            # with bottom_col1:
-            #     st.pyplot(plan_view_figure(params, theta_bottom, theta_top))
-            # with bottom_col2:
-            #     if history:
-            #         st.pyplot(convergence_figure(history))
+            with st.expander("Constitutive material law", expanded=True):
+                char_col1, char_col2 = st.columns(2)
+                with char_col1:
+                    st.plotly_chart(steel_characteristic_figure(steel_curves, eps_max_steel),
+                                     width="stretch", config=CHAR_CONFIG)
+                with char_col2:
+                    st.plotly_chart(concrete_characteristic_figure(concrete, concrete_layers, eps_max_concrete),
+                                     width="stretch", config=CHAR_CONFIG)
+
+            with st.expander("Crack orientation and spacing", expanded=True):
+                # Crack angle theta_top/theta_bottom is the concrete layer's
+                # own principal-strain direction (computed above from
+                # concrete_entries, matching how the reference figure
+                # defines it); crack spacing s_rm0_b/s_rm0_t and the cracked
+                # flag come from the reinforcement panel response instead
+                # (crack spacing and tension-stiffening onset are a
+                # reinforcement/TCM concept here, not a concrete one - see
+                # reinforcement.py). No cracks are drawn for a face whose
+                # panel hasn't actually cracked.
+                plan_col1, plan_col2 = st.columns(2)
+                with plan_col1:
+                    st.plotly_chart(
+                        plan_view_figure("Plan view - slab bottom (inf)", bottom_x, bottom_y,
+                                          bottom_resp.cracked, theta_bottom, s_rm0_b, phase=0.0),
+                        width="stretch", config=PLAN_VIEW_CONFIG,
+                    )
+                with plan_col2:
+                    st.plotly_chart(
+                        plan_view_figure("Plan view - slab top (sup)", top_x, top_y,
+                                          top_resp.cracked, theta_top, s_rm0_t, phase=1.7),
+                        width="stretch", config=PLAN_VIEW_CONFIG,
+                    )
+
+            # Convergence plot: still reported not rendering correctly for
+            # the user on an earlier (matplotlib) attempt - left disabled
+            # pending investigation, not deleted. `history` from solve() is
+            # still collected above and ready once that's revisited.
+            # if history:
+            #     st.pyplot(convergence_figure(history))
         else:
             st.info("Click **Run analysis**.")
 

@@ -55,7 +55,9 @@ src/shell_layer/
     arclength.py           Full moment-curvature path tracing: arc-length continuation
     results.py            AnalysisResult / LayerResult containers
 gui/
-    app.py                Streamlit GUI: parameter input, through-thickness plots
+    app.py                Streamlit GUI: parameter input, 3D preview, through-thickness/
+                          characteristic plots (Plotly), plan-view crack pattern
+    prototype_3d_shell.py Standalone prototype for the 3D view's design (not run by app.py)
 tests/                    pytest unit + integration tests
 examples/                 Example usage scripts
 ```

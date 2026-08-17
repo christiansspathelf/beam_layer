@@ -19,6 +19,7 @@ dev = [
 gui = [
     "streamlit>=1.30",
     "matplotlib>=3.7",
+    "plotly>=5.20",
 ]
 
 [tool.setuptools.packages.find]

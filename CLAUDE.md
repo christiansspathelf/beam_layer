@@ -151,54 +151,95 @@ results.py (AnalysisResult / LayerResult)
   `arclength.py` would be the natural next step, not yet done.
 - **`gui/app.py`**: Streamlit front end, tabbed — "Single load analysis" and
   "Complete load-deformation curve" (`trace_path()`). Adds `src/` to
-  `sys.path` manually rather than relying on the editable install.
+  `sys.path` manually rather than relying on the editable install. `gui`
+  extras now include `plotly` (was matplotlib-only) - see below.
 
-  **Single load analysis**, top to bottom: run button + a compact inline
-  status badge (not `st.success`/`st.error` - those are noticeably taller
-  than the button next to them) sharing one row via
+  **Single load analysis**, top to bottom: an always-visible, collapsible
+  "3D element geometry (live preview)" expander (`shell_3d_figure` -
+  translucent green concrete box + blue rebar tubes at each bar's true
+  individual depth + a small x/y/z coordinate triad, built with
+  Plotly/WebGL); run button + a compact inline status badge (not
+  `st.success`/`st.error` - those are noticeably taller than the button
+  next to them) sharing one row via
   `st.columns(..., vertical_alignment="center")`; the sidebar's loading
   direction values are used directly as the load (no extra kappa scaling
   factor - `solve(section, direction, ...)`, `direction` built straight
-  from the sidebar `n_ij`/`m_ij` inputs); the full-width 5-subplot
-  through-thickness figure; single-line vector results (strains+curvatures
-  merged into one `st.latex` call, unit written once; separate lines for
-  reinforcement and concrete principal stresses); then two
-  stress-strain characteristic plots side by side:
-  - `steel_characteristic_figure`: each of the 4 bars' own *operative*
-    curve - bare bilinear (solid black) or TCM (dotted black), using that
-    bar's real diameter and its panel's real crack spacing, and only
-    switching to TCM if tension stiffening is on *and* that panel is
-    actually cracked (a panel-level flag shared by its x/y bars - see
-    `reinforcement.py`'s `panel_response`) - not one generic reference
-    curve. Tensile quadrant only. Markers: white fill, black edge, one
-    shape per bar (`o`/`s`/`^`/`D`), drawn in a second pass so they sit on
-    top of every line regardless of draw order.
-  - `concrete_characteristic_figure`: one curve *per outer layer*
-    (inf solid, sup dashed), each using that layer's own companion-strain-
-    softened `peak_compressive_stress(eps1)` (falling back to unsoftened
-    `fck` when that layer's `eps1<0`, matching State [6] - see
-    `crack_membrane.py`) - a single fck-based reference curve visibly
-    missed the actual `sigma2` points whenever softening was active.
-    Compressive quadrant only, sign flipped for display (axes titled
-    `-eps`/`-sigma` so plotted values read positive) - the underlying
-    values stay negative in the solver's own convention.
+  from the sidebar `n_ij`/`m_ij` inputs); then three collapsible result
+  sections (all `expanded=True` by default):
+  - **"Resulting strain and stress state"**: single-line vector results
+    (strains+curvatures merged into one `st.latex` call, unit written
+    once; separate lines for reinforcement and concrete principal
+    stresses) plus the 5-panel through-thickness figure
+    (`cross_section_figure`: eps1, eps2, theta_r, principal concrete
+    stress, reinforcement stress-by-bar).
+  - **"Constitutive material law"**: `steel_characteristic_figure` and
+    `concrete_characteristic_figure` side by side.
+  - **"Crack orientation and spacing"**: `plan_view_figure`, bottom/top
+    face side by side (bottom-left, top-right) - concrete fill + rebar
+    grid in the same colours as the 3D view, with a crack pattern (white
+    undulating lines, real angle + spacing, not illustrative) drawn only
+    for a face whose reinforcement panel actually cracked
+    (`panel_response(...).cracked` - see `reinforcement.py`). Crack
+    *angle* is the concrete outer layer's own principal-strain direction
+    (`theta_top`/`theta_bottom`, matching how cracks actually form);
+    crack *spacing* is the reinforcement panel's real `s_rm0` (a TCM/bond
+    concept, not a concrete one) - deliberately mixing the two rather
+    than picking one source for both.
 
-  Plan view (crack pattern) and the residual-vs-iteration convergence plot
-  (`plan_view_figure`, `convergence_figure`) are implemented but currently
-  **disabled** in the display (commented out, not deleted) - reported not
-  rendering correctly for the user; the `theta_top`/`theta_bottom`
-  computation and the `history` list from `solve()` that feed them are
-  still computed and ready to re-enable once that's debugged.
-  `solve()`'s optional `history` list parameter captures a
-  residual-per-iteration trace across the whole call (probe + incremental
-  steps + kicks) - purely observational, see `solver.py`'s docstring.
+  `cross_section_figure`, `steel_characteristic_figure`,
+  `concrete_characteristic_figure`, `plan_view_figure` and
+  `shell_3d_figure` are all Plotly now, not matplotlib - every point is
+  hoverable, and this fixed a real performance problem: matplotlib's LaTeX
+  mathtext (`cm` fontset) was the dominant cost of loading these figures,
+  not the analysis itself. Axis/subplot titles use Plotly's native
+  `<sub>`/`<sup>` tag support + literal Greek Unicode (`ε`, `σ`, `θ`) -
+  **not** LaTeX: gl3d (WebGL 3D scene) axis titles were confirmed *not* to
+  support MathJax typesetting (tried twice: script injection via
+  `st.markdown(unsafe_allow_html=True)` never executes at all - browsers
+  don't run `<script>` tags inserted via innerHTML - and
+  `st.html(..., unsafe_allow_javascript=True)`, which does execute, still
+  didn't render in the 3D view). **Legend text in the 2D charts does use
+  real LaTeX** (`r"$\sigma_{c2r}$"` etc.) - ordinary 2D/SVG Plotly chart
+  text is a different rendering codepath from gl3d and does support
+  MathJax, so the same `st.html(..., unsafe_allow_javascript=True)`
+  MathJax-v2 injection (module level, once) works there. Don't reuse this
+  for gl3d text again without re-testing - that limitation was confirmed,
+  not a loading race.
+
+  **Colour scheme is dark-background-first, deliberately, not by
+  accident**: `st.plotly_chart`'s default `theme="streamlit"` repaints a
+  chart's background to match the app's active theme but leaves any
+  colour set explicitly on a trace untouched - so the original plain
+  "black" lines/markers/fills vanished against a dark Streamlit theme
+  while unstyled axis titles/ticks (which the theme *does* repaint) stayed
+  legible. Fix was to make every explicit trace colour white/light-grey
+  instead of black, not to fight the theme - see `GREY_FILL` (a solid
+  mid-grey, not the translucent-black fill originally used, which had the
+  same invisible-on-dark problem) and the comment above it. Reinforcement
+  stress bars (`cross_section_figure`'s 5th panel) share the exact same
+  `GREY_FILL` as the concrete stress panel's fill, on purpose, so the two
+  stress panels read as one consistent style rather than two different
+  greys. Every subplot also gets an explicit white border box
+  (`showline`+`linecolor="white"`+`mirror=True`) for the same reason.
+  Marker edges stay black (not white) - the markers are white-*filled*, so
+  a black edge stays visible regardless of background; only bare lines
+  with no companion fill needed to flip.
+
+  The residual-vs-iteration convergence plot (`convergence_figure`, still
+  matplotlib) is implemented but currently **disabled** in the display
+  (commented out, not deleted) - reported not rendering correctly for the
+  user; `solve()`'s optional `history` list parameter (a residual-per-
+  iteration trace across the whole call: probe + incremental steps +
+  kicks) is still collected and ready once that's revisited.
 
   A defensive retry wraps `matplotlib.mathtext.MathTextParser.parse` at
   module load: under Streamlit's threaded execution, the first mathtext
   calls in a process can intermittently raise a spurious `ParseException`
   on valid strings (a mathtext-cache race, reproduced with plain `$x$`
   failing once then succeeding immediately after) - not a real syntax
-  problem, don't "fix" it by rewriting label strings.
+  problem, don't "fix" it by rewriting label strings. Only still exercised
+  by `tab_curve`'s M-chi plot and the disabled `convergence_figure` - the
+  single-load tab's figures no longer touch matplotlib mathtext at all.
 
   **Formatting convention**: no space (nor `\,`) between a formatted number
   and a `%`/`‰` suffix in either f-strings or LaTeX (`st.latex`) - e.g.
@@ -209,6 +250,22 @@ results.py (AnalysisResult / LayerResult)
   manually) rather than `st.number_input` - a native number input can't
   show a custom thousands separator while staying editable, a browser
   limitation, not a Streamlit one.
+
+- **`gui/prototype_3d_shell.py`**: standalone (not imported by `app.py`)
+  Streamlit prototype used to work out the 3D view's design before porting
+  it into `app.py` - camera orientation matched against a user-supplied
+  reference axonometric figure (x back-right, y toward the viewer, z
+  straight down through a top-face-centred triad), `dragmode="turntable"`
+  (not `"orbit"`) so z stays vertical on screen during rotation, and the
+  z-negate-for-display trick (real data stays z-positive-down; only the
+  plotted coordinate is negated, with tick labels negated back) used to
+  get that orientation via Plotly's own well-tested default camera instead
+  of a hand-derived custom eye/up pair (an earlier custom-vector attempt
+  matched the desired mapping analytically but rendered wrong under
+  `dragmode="turntable"` - suspected turntable-specific mishandling of a
+  non-canonical `up` vector, not something to re-attempt blind). Kept
+  around as the design-history reference for any further 3D/Plotly GUI
+  work, not meant to be run as part of the app.
 
 ## Conventions worth knowing before editing
 
