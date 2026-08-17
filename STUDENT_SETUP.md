@@ -1,132 +1,143 @@
-# Getting started (for students)
+# Erste Schritte (für Studierende)
 
-This is a step-by-step guide for getting `shell_layer` running on your own
-computer, written assuming little to no prior Python experience. If you
-already know your way around Python and virtual environments, the short
-version is in `README.md`'s "Getting started" section instead.
+Diese Anleitung erklärt Schritt für Schritt, wie du `shell_layer` auf
+deinem eigenen Computer zum Laufen bringst — geschrieben für den Fall,
+dass du wenig bis keine Vorerfahrung mit Python hast. Falls du dich mit
+Python und virtuellen Umgebungen bereits auskennst, findest du die
+Kurzversion stattdessen im Abschnitt "Getting started" der `README.md`.
 
-These instructions assume **Windows**. If you're on Mac or Linux, the
-commands are the same idea but use `.venv/bin/...` instead of
+Diese Anleitung geht von **Windows** aus. Auf Mac oder Linux funktionieren
+die Befehle nach demselben Prinzip, verwenden aber `.venv/bin/...` statt
 `.venv\Scripts\...`.
 
-## 1. Install Python
+## 1. Python installieren
 
-Skip this step if you already have Python 3.10 or newer.
+Diesen Schritt kannst du überspringen, falls bereits Python 3.10 oder
+neuer installiert ist.
 
-1. Go to [python.org/downloads](https://www.python.org/downloads/) and
-   download the latest Python 3 installer.
-2. Run it. **On the very first screen, tick the checkbox "Add python.exe
-   to PATH"** before clicking Install — this is the single most common
-   thing people forget, and without it none of the commands below will
-   work.
-3. To check it worked, open a terminal (see step 3 below) and run:
+1. Gehe auf [python.org/downloads](https://www.python.org/downloads/) und
+   lade den neuesten Python-3-Installer herunter.
+2. Führe ihn aus. **Setze auf dem allerersten Bildschirm das Häkchen bei
+   "Add python.exe to PATH"**, bevor du auf Install klickst — das ist der
+   mit Abstand häufigste Punkt, der vergessen wird, und ohne ihn
+   funktioniert keiner der folgenden Befehle.
+3. Um zu prüfen, ob es geklappt hat, öffne ein Terminal (siehe Schritt 3
+   weiter unten) und führe aus:
    ```
    python --version
    ```
-   You should see something like `Python 3.12.4`. If you instead see an
-   error like "python is not recognized", Python either isn't installed
-   or wasn't added to PATH — reinstall and make sure to tick that box.
+   Es sollte etwas wie `Python 3.12.4` erscheinen. Falls stattdessen eine
+   Fehlermeldung wie "python is not recognized" kommt, ist Python
+   entweder nicht installiert oder wurde nicht zum PATH hinzugefügt —
+   installiere es neu und achte diesmal auf das Häkchen.
 
-## 2. Get the code
+## 2. Den Code besorgen
 
-If you were given a GitHub link (e.g.
-`https://github.com/christiansspathelf/shell_layer`), you have two
-options — pick whichever feels easier:
+Falls du einen GitHub-Link erhalten hast (z. B.
+`https://github.com/christiansspathelf/shell_layer`), gibt es zwei
+Möglichkeiten — wähle, was dir leichter fällt:
 
-- **Simplest**: on the GitHub page, click the green **Code** button →
-  **Download ZIP**, then unzip it somewhere convenient (e.g. your
-  Desktop or a `dev` folder).
-- **If you have Git installed**: open a terminal in the folder where you
-  want the project and run:
+- **Am einfachsten**: Auf der GitHub-Seite auf den grünen Button
+  **Code** → **Download ZIP** klicken und die Datei irgendwo entpacken,
+  z. B. auf dem Desktop oder in einem `dev`-Ordner.
+- **Falls Git installiert ist**: Öffne ein Terminal in dem Ordner, in dem
+  das Projekt liegen soll, und führe aus:
   ```
   git clone https://github.com/christiansspathelf/shell_layer.git
   ```
-  This is nicer if your supervisor pushes updates later — `git pull`
-  inside the folder fetches them, whereas a ZIP download needs to be
-  redone from scratch each time.
+  Das ist praktischer, falls dein Betreuer später Änderungen pusht — mit
+  `git pull` im Projektordner holst du sie dann einfach nach, während ein
+  ZIP-Download jedes Mal von Neuem gemacht werden müsste.
 
-## 3. Open a terminal in the project folder
+## 3. Ein Terminal im Projektordner öffnen
 
-- In Windows Explorer, navigate into the `shell_layer` folder (the one
-  containing `pyproject.toml`, `src/`, `gui/`, etc.).
-- Click the address bar, type `powershell`, and press Enter. This opens
-  a PowerShell terminal already located in that folder.
+- Navigiere im Windows-Explorer in den Ordner `shell_layer` (den, der
+  `pyproject.toml`, `src/`, `gui/` usw. enthält).
+- Klicke in die Adresszeile, tippe `powershell` und drücke Enter. Damit
+  öffnet sich ein PowerShell-Terminal direkt in diesem Ordner.
 
-## 4. Create the virtual environment
+## 4. Die virtuelle Umgebung erstellen
 
-A "virtual environment" is just a private, self-contained copy of Python
-for this one project, so its packages don't clash with anything else on
-your machine. Create it once:
+Eine "virtuelle Umgebung" ist einfach eine private, in sich
+abgeschlossene Kopie von Python nur für dieses eine Projekt, damit sich
+seine Pakete nicht mit irgendetwas anderem auf deinem Rechner in die
+Quere kommen. Einmalig erstellen mit:
 
 ```
 python -m venv .venv
 ```
 
-This creates a `.venv` folder inside the project. **Do not move, rename,
-or copy this folder to another machine** — it's tied to the exact Python
-install and file paths on this computer. If you ever need it on another
-machine, just re-run this same command there.
+Das erzeugt einen Ordner `.venv` innerhalb des Projekts. **Diesen Ordner
+nicht verschieben, umbenennen oder auf einen anderen Rechner kopieren**
+— er ist an die genaue Python-Installation und die Dateipfade auf diesem
+Computer gebunden. Falls du ihn auf einem anderen Rechner brauchst, führe
+einfach denselben Befehl dort erneut aus.
 
-## 5. Install the project's dependencies into it
+## 5. Die Abhängigkeiten des Projekts installieren
 
 ```
 .venv\Scripts\pip install -e ".[dev,gui]"
 ```
 
-This reads `pyproject.toml` and installs everything the project needs
-(NumPy, pytest, Streamlit, Plotly, Matplotlib) into `.venv`, plus the
-`shell_layer` package itself in "editable" mode — meaning if you or your
-supervisor edit the source code afterward, you don't need to reinstall
-anything to see the changes. This step needs an internet connection and
-can take a minute or two the first time.
+Dieser Befehl liest `pyproject.toml` und installiert alles, was das
+Projekt benötigt (NumPy, pytest, Streamlit, Plotly, Matplotlib) in
+`.venv`, zusammen mit dem `shell_layer`-Paket selbst im "editable"-Modus
+— das heisst, wenn du oder dein Betreuer später den Quellcode ändern,
+muss danach nichts neu installiert werden, damit die Änderungen wirksam
+werden. Dieser Schritt braucht eine Internetverbindung und kann beim
+ersten Mal ein bis zwei Minuten dauern.
 
-Note there's no need to "activate" the virtual environment — every
-command below calls the tools inside `.venv\Scripts\` directly by their
-full path, which has the same effect and is one less thing to remember.
+Die virtuelle Umgebung muss dabei nicht "aktiviert" werden — jeder Befehl
+weiter unten ruft die Tools in `.venv\Scripts\` direkt über ihren
+vollständigen Pfad auf, was denselben Effekt hat und eine Sache weniger
+ist, die man sich merken muss.
 
-## 6. Run the GUI
+## 6. Die GUI starten
 
 ```
 .venv\Scripts\streamlit run gui\app.py
 ```
 
-This starts a local web server and should automatically open the app in
-your browser (usually at `http://localhost:8501`). Leave the terminal
-window open while you're using it — closing it stops the server. Press
-`Ctrl+C` in the terminal when you're done.
+Das startet einen lokalen Webserver und sollte die App automatisch im
+Browser öffnen (normalerweise unter `http://localhost:8501`). Lasse das
+Terminal-Fenster offen, solange du die App benutzt — schliesst du es,
+stoppt der Server. Mit `Ctrl+C` im Terminal beendest du ihn, wenn du
+fertig bist.
 
-## 7. (Optional) Check everything works with the test suite
+## 7. (Optional) Mit der Testsuite prüfen, ob alles funktioniert
 
 ```
 .venv\Scripts\pytest
 ```
 
-This runs the project's automated tests. Seeing everything pass (no red
-`FAILED` lines) is a good sign that steps 4–5 went correctly.
+Das führt die automatisierten Tests des Projekts aus. Wenn alles ohne
+rote `FAILED`-Zeilen durchläuft, ist das ein gutes Zeichen, dass Schritt
+4–5 korrekt geklappt haben.
 
-## 8. (Optional) Run a plain script example
+## 8. (Optional) Ein einfaches Beispielskript ausführen
 
 ```
 .venv\Scripts\python examples\basic_analysis.py
 ```
 
-Useful if you want to poke at the solver directly in code rather than
-through the GUI.
+Nützlich, wenn du direkt im Code mit dem Solver herumprobieren willst,
+statt über die GUI.
 
-## If something goes wrong
+## Falls etwas nicht funktioniert
 
-- **"python is not recognized"** → Python isn't on PATH; reinstall it
-  and tick "Add python.exe to PATH" (step 1).
-- **`pip install` fails with a network/SSL error** → usually a firewall
-  or VPN issue; try again on a different network, or ask your
-  supervisor/IT.
-- **PowerShell says something about "execution of scripts is disabled"**
-  → this only happens if you try to *activate* the virtual environment
-  (`.venv\Scripts\Activate.ps1`); since these instructions never do
-  that, you shouldn't hit it. If you do, `pip`/`streamlit`/`python`
-  called with their full `.venv\Scripts\...` path (as above) still work
-  regardless.
-- Anything else: check `README.md` (project overview and model
-  description) and `CLAUDE.md` (much more detailed technical notes on
-  the code itself, written for AI-assisted development but equally
-  useful for understanding *why* things are built the way they are).
+- **"python is not recognized"** → Python ist nicht im PATH; neu
+  installieren und dabei "Add python.exe to PATH" ankreuzen (Schritt 1).
+- **`pip install` schlägt mit einem Netzwerk-/SSL-Fehler fehl** → meist
+  ein Firewall- oder VPN-Problem; in einem anderen Netzwerk nochmal
+  versuchen, oder Betreuer/IT fragen.
+- **PowerShell meldet etwas über "execution of scripts is disabled"**
+  → das passiert nur, wenn man versucht, die virtuelle Umgebung zu
+  *aktivieren* (`.venv\Scripts\Activate.ps1`); da diese Anleitung das nie
+  tut, sollte das nicht auftreten. Falls doch: `pip`/`streamlit`/`python`
+  funktionieren trotzdem, wenn sie wie oben über ihren vollständigen
+  `.venv\Scripts\...`-Pfad aufgerufen werden.
+- Bei allem anderen: `README.md` (Projektüberblick und Modellbeschreibung)
+  und `CLAUDE.md` (deutlich detailliertere technische Hinweise zum Code
+  selbst, geschrieben für KI-gestützte Entwicklung, aber genauso
+  hilfreich, um zu verstehen, *warum* die Dinge so gebaut sind, wie sie
+  sind) konsultieren.
