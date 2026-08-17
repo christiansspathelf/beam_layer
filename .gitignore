@@ -62,6 +62,3 @@ secrets.*
 /data/
 /results/
 /output/
-
-# Large reference documents kept locally, not in git history
-examples/Spathelf2018.pdf
