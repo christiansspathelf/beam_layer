@@ -7,7 +7,7 @@ from typing import List, Tuple
 
 import numpy as np
 
-from .crack_membrane import ConcreteStressState, concrete_stress
+from .crack_membrane import ConcreteStressState, concrete_stress_batch
 from .geometry import ShellParameters
 from .layers import ConcreteLayer, discretize_concrete
 from .materials.concrete import ConcreteMaterial
@@ -47,23 +47,36 @@ class LayeredSection:
         self.steel = steel
         self.tension_stiffening = tension_stiffening
         self.concrete_layers: List[ConcreteLayer] = discretize_concrete(params.thickness, n_concrete_layers)
+        self._layer_z = np.array([layer.z for layer in self.concrete_layers])
+        self._layer_thickness = np.array([layer.thickness for layer in self.concrete_layers])
         self.bottom_panel, self.top_panel = build_reinforcement_panels(params)
 
-    def internal_forces(self, eps0: np.ndarray, kappa: np.ndarray):
-        """Integrate layer stresses into [n_x,n_y,n_xy,m_x,m_y,m_xy]
-        (kN/m, kNm/m), returning per-layer diagnostic state alongside.
+    def _concrete_forces_batch(self, eps0: np.ndarray, kappa: np.ndarray):
+        """Concrete layers' contribution to F, evaluated across all layers
+        in one vectorized call (`concrete_stress_batch`) instead of a
+        Python loop calling `concrete_stress` once per layer - see that
+        function's docstring. Returns (F_concrete, arrays) where `arrays`
+        is the raw per-layer (sigma_x, sigma_y, tau_xy, sigma1, sigma2,
+        eps1, eps2, theta1, cracked, f_c) tuple, reused by both
+        `forces_only` (discarded) and `internal_forces` (packaged into
+        `ConcreteStressState`s).
         """
+        z, t = self._layer_z, self._layer_thickness
+        eps_x, eps_y, gamma_xy = strain_at(z, eps0, kappa)
+        arrays = concrete_stress_batch(eps_x, eps_y, gamma_xy, self.concrete)
+        sigma_x, sigma_y, tau_xy = arrays[0], arrays[1], arrays[2]
+        sigma_kpa = np.stack([sigma_x, sigma_y, tau_xy], axis=1) * MPA_TO_KPA
         F = np.zeros(6)
-        layer_data = []
+        F[:3] = np.sum(sigma_kpa * t[:, None], axis=0)
+        F[3:] = np.sum(sigma_kpa * t[:, None] * z[:, None], axis=0)
+        return F, arrays
 
-        for layer in self.concrete_layers:
-            ex, ey, gxy = strain_at(layer.z, eps0, kappa)
-            state = concrete_stress(ex, ey, gxy, self.concrete)
-            sigma_kpa = np.array([state.sigma_x, state.sigma_y, state.tau_xy]) * MPA_TO_KPA
-            F[:3] += sigma_kpa * layer.thickness
-            F[3:] += sigma_kpa * layer.thickness * layer.z
-            layer_data.append(("concrete", layer.z, state))
-
+    def _panel_forces(self, F: np.ndarray, eps0: np.ndarray, kappa: np.ndarray):
+        """Adds the two reinforcement panels' contribution to `F` in place
+        and returns their (kind, z, state) diagnostic entries. Only 2
+        panels - always cheap, never worth vectorizing.
+        """
+        panel_data = []
         for panel in (self.bottom_panel, self.top_panel):
             ex, ey, gxy = strain_at(panel.z, eps0, kappa)
             resp = panel_response(panel, ex, ey, gxy, self.concrete, self.steel, self.tension_stiffening)
@@ -73,7 +86,39 @@ class LayeredSection:
             F[1] += n_y
             F[3] += n_x * panel.z
             F[4] += n_y * panel.z
-            layer_data.append(("reinforcement", panel.z, resp))
+            panel_data.append(("reinforcement", panel.z, resp))
+        return panel_data
+
+    def forces_only(self, eps0: np.ndarray, kappa: np.ndarray) -> np.ndarray:
+        """F only, skipping the per-layer `ConcreteStressState`/diagnostic
+        construction that `internal_forces` does - for the Newton solver's
+        hot loop (residual + line-search trials, called ~15x per iteration,
+        see solver.py's module docstring), which never consumes
+        `layer_data`. Numerically identical to `internal_forces`'s F
+        (cross-checked in `tests/test_solver.py`).
+        """
+        F, _ = self._concrete_forces_batch(eps0, kappa)
+        self._panel_forces(F, eps0, kappa)
+        return F
+
+    def internal_forces(self, eps0: np.ndarray, kappa: np.ndarray):
+        """Integrate layer stresses into [n_x,n_y,n_xy,m_x,m_y,m_xy]
+        (kN/m, kNm/m), returning per-layer diagnostic state alongside.
+        """
+        F, arrays = self._concrete_forces_batch(eps0, kappa)
+        sigma_x, sigma_y, tau_xy, sigma1, sigma2, eps1, eps2, theta1, cracked, f_c = arrays
+
+        layer_data = []
+        for i, layer in enumerate(self.concrete_layers):
+            state = ConcreteStressState(
+                float(sigma_x[i]), float(sigma_y[i]), float(tau_xy[i]),
+                float(sigma1[i]), float(sigma2[i]),
+                float(eps1[i]), float(eps2[i]), float(theta1[i]),
+                bool(cracked[i]), float(f_c[i]),
+            )
+            layer_data.append(("concrete", layer.z, state))
+
+        layer_data.extend(self._panel_forces(F, eps0, kappa))
 
         return F, layer_data
 

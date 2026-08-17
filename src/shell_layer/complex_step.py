@@ -68,6 +68,7 @@ from typing import Union
 
 import numpy as np
 
+from .crack_membrane import select_ordered
 from .materials.concrete import ConcreteMaterial
 from .materials.steel import SteelMaterial
 from .reinforcement import ReinforcementPanel
@@ -79,7 +80,10 @@ Num = Union[float, complex]
 
 
 def _re(x: Num) -> float:
-    return x.real if isinstance(x, complex) else x
+    # Python floats implement `.real` too (returns themselves), so this
+    # works for both without an isinstance check - cut for speed, this ran
+    # ~490k times per solve in profiling (~9.5% of total runtime).
+    return x.real
 
 
 def _cabs(x: Num) -> Num:
@@ -248,6 +252,110 @@ def _tcm_stress_cs(eps_m: Num, mat: SteelMaterial, diam: float, s_rm: Num,
     return 0.0
 
 
+def _atan2_cs_batch(y: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Vectorized mirror of `_atan2_cs` across an array of layers - same
+    quadrant logic, real-part-only branch decisions. `x==0` entries get a
+    dummy safe divisor (any nonzero value) before the shared division, since
+    `np.where` evaluates both branches unconditionally and their real
+    result is discarded anyway for those entries; the true value for those
+    entries comes from the y>0/y<0/y==0 branches below, not from `base`.
+    """
+    xr, yr = x.real, y.real
+    x_safe = np.where(xr == 0, 1.0, x)
+    base = np.arctan(y / x_safe)
+    neg_branch = np.where(yr >= 0, base + math.pi, base - math.pi)
+    zero_branch = np.where(yr > 0, complex(math.pi / 2.0),
+                            np.where(yr < 0, complex(-math.pi / 2.0), complex(0.0)))
+    return np.where(xr > 0, base, np.where(xr < 0, neg_branch, zero_branch))
+
+
+def _principal_strain_cs_batch(eps_x: np.ndarray, eps_y: np.ndarray, gamma_xy: np.ndarray):
+    avg = 0.5 * (eps_x + eps_y)
+    radius = 0.5 * ((eps_x - eps_y) ** 2 + gamma_xy**2) ** 0.5
+    eps1 = avg + radius
+    eps2 = avg - radius
+    theta1 = 0.5 * _atan2_cs_batch(gamma_xy, eps_x - eps_y)
+    return eps1, eps2, theta1
+
+
+def _to_cartesian_cs_batch(sigma1: np.ndarray, sigma2: np.ndarray, theta1: np.ndarray):
+    c, s = np.cos(theta1), np.sin(theta1)
+    sigma_x = sigma1 * c * c + sigma2 * s * s
+    sigma_y = sigma1 * s * s + sigma2 * c * c
+    tau_xy = (sigma1 - sigma2) * s * c
+    return sigma_x, sigma_y, tau_xy
+
+
+def _peak_compressive_stress_cs_batch(mat: ConcreteMaterial, eps1: np.ndarray) -> np.ndarray:
+    val = mat.fck ** (2.0 / 3.0) / (0.4 + 30.0 * eps1)
+    return np.where(val.real <= mat.fck, val, complex(mat.fck))
+
+
+def _compression_stress_cs_batch(mat: ConcreteMaterial, eps2: np.ndarray, f_c: np.ndarray) -> np.ndarray:
+    return np.where(eps2.real < -mat.eps_c0, 0.0, f_c * (eps2**2 + 2.0 * eps2 * mat.eps_c0) / mat.eps_c0**2)
+
+
+def _concrete_stress_cs_batch(eps_x: np.ndarray, eps_y: np.ndarray, gamma_xy: np.ndarray,
+                               mat: ConcreteMaterial):
+    """Vectorized mirror of `_concrete_stress_cs` across all concrete
+    layers in one call - same 6-state branch order and formulas as
+    `crack_membrane.concrete_stress_batch`, just complex-dtype and
+    real-part-only branch conditions (see this module's docstring on why
+    that's needed for the exact complex-step derivative). This is the
+    single biggest cost in `tangent_complex_step` per profiling (~65% of a
+    full solve) - see solver.py's module docstring.
+    """
+    eps1, eps2, theta1 = _principal_strain_cs_batch(eps_x, eps_y, gamma_xy)
+    eps1_r, eps2_r = eps1.real, eps2.real
+    eps_ct = mat.eps_cr
+    nu = mat.nu
+
+    f_c_soft = _peak_compressive_stress_cs_batch(mat, eps1)
+    zeros = np.zeros_like(eps1)
+
+    # [1] Uncracked, biaxial tension
+    factor = mat.Ecm / (1 - nu**2)
+    sx1 = factor * (eps_x + nu * eps_y)
+    sy1 = factor * (eps_y + nu * eps_x)
+    txy1 = factor * (1 - nu) / 2 * gamma_xy
+
+    # [2] Uncracked, light tension-compression
+    sigma1_2 = mat.Ecm * eps1
+    sigma2_2 = _compression_stress_cs_batch(mat, eps2, f_c_soft)
+    sx2, sy2, txy2 = _to_cartesian_cs_batch(sigma1_2, sigma2_2, theta1)
+
+    # [3] Cracked (one direction), compressive diagonal
+    sigma2_3 = _compression_stress_cs_batch(mat, eps2, f_c_soft)
+    sx3, sy3, txy3 = _to_cartesian_cs_batch(zeros, sigma2_3, theta1)
+
+    # [4] Cracked (one direction), tensile diagonal
+    sigma2_4 = mat.Ecm * eps2
+    sx4, sy4, txy4 = _to_cartesian_cs_batch(zeros, sigma2_4, theta1)
+
+    # [5] Cracked in both directions - concrete carries nothing
+    sx5 = sy5 = txy5 = zeros
+
+    # [6] Biaxial compression
+    f_c6 = mat.fck
+    sigma1_6 = np.where(eps1_r < -mat.eps_c0, 0.0, f_c6 * (eps1**2 + 2 * eps1 * mat.eps_c0) / mat.eps_c0**2)
+    sigma2_6 = np.where(eps2_r < -mat.eps_c0, 0.0, f_c6 * (eps2**2 + 2 * eps2 * mat.eps_c0) / mat.eps_c0**2)
+    sx6, sy6, txy6 = _to_cartesian_cs_batch(sigma1_6, sigma2_6, theta1)
+
+    cond1 = (eps1_r <= eps_ct) & (eps2_r >= 0)
+    cond2 = (eps1_r >= 0) & (eps1_r <= eps_ct) & (eps2_r <= 0)
+    cond3 = (eps1_r >= eps_ct) & (eps2_r <= 0)
+    cond4 = (eps1_r >= 0) & (eps2_r >= 0) & (eps2_r <= eps_ct)
+    cond5 = (eps1_r >= eps_ct) & (eps2_r >= eps_ct)
+    cond6 = (eps1_r <= 0) & (eps2_r <= 0)
+    condlist = [cond1, cond2, cond3, cond4, cond5, cond6]
+
+    zero_c = complex(0.0)
+    sigma_x = select_ordered(condlist, [sx1, sx2, sx3, sx4, sx5, sx6], zero_c)
+    sigma_y = select_ordered(condlist, [sy1, sy2, sy3, sy4, sy5, sy6], zero_c)
+    tau_xy = select_ordered(condlist, [txy1, txy2, txy3, txy4, txy5, txy6], zero_c)
+    return sigma_x, sigma_y, tau_xy
+
+
 def _crack_spacing_cs(s_rmx0: float, s_rmy0: float, theta1: Num) -> Num:
     c, s = _cabs(cmath.cos(theta1)), _cabs(cmath.sin(theta1))
     if _re(s) < 1e-9:
@@ -288,16 +396,20 @@ def _panel_response_cs(panel: ReinforcementPanel, eps_x: Num, eps_y: Num, gamma_
 def _internal_forces_cs(section: LayeredSection, eps0: np.ndarray, kappa: np.ndarray) -> np.ndarray:
     """Complex-safe mirror of `LayeredSection.internal_forces`, returning
     just F (complex dtype) - no per-layer diagnostic state, which the
-    tangent computation doesn't need.
+    tangent computation doesn't need. Concrete layers are evaluated in one
+    vectorized `_concrete_stress_cs_batch` call rather than a Python loop
+    calling `_concrete_stress_cs` per layer - see that function's
+    docstring; this was the dominant cost of `tangent_complex_step` in
+    profiling.
     """
     F = np.zeros(6, dtype=complex)
 
-    for layer in section.concrete_layers:
-        ex, ey, gxy = strain_at(layer.z, eps0, kappa)
-        sx, sy, txy = _concrete_stress_cs(ex, ey, gxy, section.concrete)
-        sigma_kpa = np.array([sx, sy, txy], dtype=complex) * MPA_TO_KPA
-        F[:3] += sigma_kpa * layer.thickness
-        F[3:] += sigma_kpa * layer.thickness * layer.z
+    z, t = section._layer_z, section._layer_thickness
+    eps_x, eps_y, gamma_xy = strain_at(z, eps0, kappa)
+    sx, sy, txy = _concrete_stress_cs_batch(eps_x, eps_y, gamma_xy, section.concrete)
+    sigma_kpa = np.stack([sx, sy, txy], axis=1) * MPA_TO_KPA
+    F[:3] += np.sum(sigma_kpa * t[:, None], axis=0)
+    F[3:] += np.sum(sigma_kpa * t[:, None] * z[:, None], axis=0)
 
     for panel in (section.bottom_panel, section.top_panel):
         ex, ey, gxy = strain_at(panel.z, eps0, kappa)

@@ -20,14 +20,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from shell_layer import (  # noqa: E402
     ConcreteMaterial,
+    FailureDiagnosis,
     LayeredSection,
     ReinforcementLayout,
     SectionForces,
     ShellParameters,
     SteelMaterial,
+    diagnose_failure,
     individual_bar_depths,
     solve,
-    trace_path,
+    sweep_load_factor,
 )
 from shell_layer.crack_membrane import principal_strain  # noqa: E402
 from shell_layer.layers import discretize_concrete  # noqa: E402
@@ -799,6 +801,73 @@ params = ShellParameters(
 direction = SectionForces(dir_n_xx, dir_n_yy, dir_n_xy, dir_m_xx, dir_m_yy, dir_m_xy)
 direction_norm = float(np.linalg.norm(direction.to_vector()))
 
+
+def _failure_prognosis(diag: FailureDiagnosis) -> str:
+    """Plain-language read of a FailureDiagnosis for the status badge.
+    Concrete crushing / reinforcement rupture (the model's own explicit
+    failure criteria - see diagnosis.py) take priority over the softer
+    corroborating signals (tangent conditioning, load-sweep plateau)
+    since they directly answer "which part of the section gave out",
+    which is what's actually being asked for here - the other signals
+    only matter when neither of those has tripped yet.
+    """
+    if diag.concrete_crushed and diag.reinforcement_ruptured:
+        return "Concrete crushing and reinforcement rupture"
+    if diag.concrete_crushed:
+        return "Concrete crushing (compression failure)"
+    if diag.reinforcement_ruptured:
+        return "Reinforcement rupture (steel strain past εsu)"
+    if diag.verdict == "likely_physical_limit":
+        return "Approaching a structural limit (tangent stiffness trending singular) - not yet localized to a specific layer"
+    if diag.verdict == "likely_numerical":
+        return "Likely a numerical/discretization difficulty, not a physical capacity limit"
+    return "Inconclusive - see details below"
+
+
+def _render_failure_diagnostic(section, forces, result, diagnosis: FailureDiagnosis, key_suffix: str
+                                ) -> FailureDiagnosis:
+    """Shared 'Failure diagnostic' expander - prognosis, supporting
+    reasons, tangent conditioning, and an optional deeper load-sweep
+    check (see diagnosis.py). Used by both the single-load status badge
+    and the load-deformation curve's failing point, so the two stay
+    consistent. Returns the (possibly updated, if the deeper check was
+    run) diagnosis - the caller is responsible for persisting it back to
+    whichever session_state key it came from.
+    """
+    with st.expander("Failure diagnostic", expanded=True):
+        st.markdown(f"**{_failure_prognosis(diagnosis)}**")
+        for reason in diagnosis.reasons:
+            st.markdown(f"- {reason}")
+        st.caption(
+            f"Tangent stiffness singular ratio (smallest/largest singular value): "
+            f"{diagnosis.tangent_singular_ratio:.2e} - near 0 means the tangent is "
+            f"trending singular, the mathematical signature of a genuine limit point."
+        )
+        if st.button("Run deeper diagnostic (load sweep, several extra solves)", key=f"deep_diag_{key_suffix}"):
+            with st.spinner("Sweeping load levels..."):
+                diagnosis = diagnose_failure(section, forces, result, run_sweep=True)
+        if diagnosis.sweep is not None:
+            st.markdown(
+                "Curvature plateauing while the residual keeps growing as the load "
+                "fraction approaches 1.0 is the signature of a genuine capacity limit "
+                "(confirmed for this project's Case 2 pure-torsion investigation):"
+            )
+            st.dataframe(
+                [
+                    {
+                        "load fraction": frac,
+                        "converged": conv,
+                        "‖χ‖ [1/m]": kappa_norm,
+                        "residual": residual,
+                    }
+                    for frac, conv, kappa_norm, residual in diagnosis.sweep
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+    return diagnosis
+
+
 tab_single, tab_curve = st.tabs(["Single load analysis", "Complete load-deformation curve"])
 
 with tab_single:
@@ -830,14 +899,24 @@ with tab_single:
             elapsed = time.perf_counter() - start
             st.session_state["result"] = result
             st.session_state["section_for_result"] = section
+            st.session_state["direction_for_result"] = direction
             st.session_state["history"] = history
             st.session_state["elapsed"] = elapsed
+            # Cheap diagnosis (crushing/rupture check + one extra tangent
+            # eval, no extra solves) runs automatically on failure; the
+            # optional load-sweep deep-dive (see below) is user-triggered
+            # since it costs several extra solves.
+            st.session_state["diagnosis"] = (
+                diagnose_failure(section, direction, result, run_sweep=False) if not result.converged else None
+            )
 
         if "result" in st.session_state:
             result = st.session_state["result"]
             section = st.session_state["section_for_result"]
+            direction_for_result = st.session_state["direction_for_result"]
             history = st.session_state["history"]
             elapsed = st.session_state["elapsed"]
+            diagnosis = st.session_state.get("diagnosis")
 
             with status_col:
                 # A plain st.success()/st.error() box is noticeably taller
@@ -856,12 +935,19 @@ with tab_single:
                         unsafe_allow_html=True,
                     )
                 else:
+                    prognosis = _failure_prognosis(diagnosis) if diagnosis is not None else ""
                     st.markdown(
                         f'<div style="{badge_style}background-color:#f8d7da;color:#721c24;">'
                         f"✗ Not converged after {result.iterations} iterations ({elapsed:.3f} s) "
-                        f"— residual = {result.residual_norm:.3f}</div>",
+                        f"— residual = {result.residual_norm:.3f}<br>"
+                        f"<b>Prognosis:</b> {prognosis}</div>",
                         unsafe_allow_html=True,
                     )
+
+            if not result.converged and diagnosis is not None:
+                st.session_state["diagnosis"] = _render_failure_diagnostic(
+                    section, direction_for_result, result, diagnosis, key_suffix="single"
+                )
 
             _, layer_data = section.internal_forces(result.eps0, result.kappa)
             concrete_entries = [(z, s) for kind, z, s in layer_data if kind == "concrete"]
@@ -937,7 +1023,7 @@ with tab_single:
                     r"[\varepsilon_{x,0},\ \varepsilon_{y,0},\ \gamma_{xy,0}]="
                     r"[%.4f,\ %.4f,\ %.4f]\text{‰}"
                     r"\qquad"
-                    r"[\kappa_{x},\ \kappa_{y},\ \kappa_{xy}]="
+                    r"[\chi_{x},\ \chi_{y},\ \chi_{xy}]="
                     r"[%.4f,\ %.4f,\ %.4f]\,\text{mrad/m}"
                     % (tuple(v * 1000 for v in result.eps0) + tuple(v * 1000 for v in result.kappa))
                 )
@@ -1009,57 +1095,75 @@ with tab_curve:
         st.error("Set a nonzero loading direction in the sidebar.")
     else:
         st.caption(
-            "Traces the full path via arc-length continuation (not a single "
-            "target solve), so it can follow the response through cracking."
+            "Scales the sidebar's loading direction by an increasing load "
+            "factor $\\lambda$ ($\\lambda=1$ is exactly the sidebar's "
+            "specified load) and solves each point directly with the "
+            "damped-Newton solver, warm-started from the previous point - "
+            "simpler than arc-length continuation, and just as valid here "
+            "since this model has no post-peak softening branch to trace "
+            "past a genuine capacity limit (see CLAUDE.md). The sweep "
+            "stops automatically once it reaches one, using the same "
+            "failure diagnostic as the single-load tab."
         )
-        curve_max_lambda = st.number_input(
-            r"Max $\kappa$ (0 = unbounded, stop only on max steps / ultimate strain)",
-            min_value=0.0, value=0.0, step=10.0,
-        )
-        curve_max_steps = st.slider("Max steps (adaptive spacing in $\\kappa$, capped here)",
-                                     min_value=5, max_value=60, value=25, step=5)
+        curve_col1, curve_col2 = st.columns(2)
+        with curve_col1:
+            curve_n_points = st.slider("Number of points along the curve", min_value=3, max_value=60, value=15)
+        with curve_col2:
+            curve_max_lambda = st.number_input(
+                r"Max load factor $\lambda$ ($\lambda=1$ = sidebar's specified load)",
+                min_value=0.1, value=2.0, step=0.1,
+            )
         st.caption(
-            "Crossing each crack/yield transition costs a real sub-solve "
-            "(~1-3 s) - a curve that runs deep into cracking can take a "
-            "while. Start with a small step count to explore."
+            "The sweep stops as soon as a point is diagnosed as a genuine "
+            "capacity limit, so it may finish with fewer points than "
+            "requested - increase the max load factor if it reaches "
+            "$\\lambda_{max}$ without failing and you want to push further."
         )
-        trace = st.button("Trace M-χ curve", type="primary")
+        trace = st.button("Compute load-deformation curve", type="primary")
 
         if trace:
             section = LayeredSection(params, concrete, steel, tension_stiffening=tension_stiffening,
                                       n_concrete_layers=n_concrete_layers)
-            with st.spinner(
-                "Tracing moment-curvature path - crossing each crack/yield transition can take a few seconds..."
-            ):
-                path = trace_path(section, direction,
-                                   max_lambda=curve_max_lambda if curve_max_lambda > 0 else None,
-                                   max_steps=curve_max_steps)
+            with st.spinner(f"Solving up to {curve_n_points} load levels..."):
+                path, curve_diagnosis = sweep_load_factor(section, direction, curve_n_points, curve_max_lambda)
             st.session_state["path"] = path
+            st.session_state["curve_diagnosis"] = curve_diagnosis
 
         if "path" in st.session_state:
             path = st.session_state["path"]
+            curve_diagnosis = st.session_state.get("curve_diagnosis")
             n_not_converged = sum(1 for p in path.points if not p.converged)
 
             st.caption(
-                f"{len(path.points)} points traced for direction "
+                f"{len(path.points)} point(s) solved for direction "
                 f"$n_{{xx}}$={path.direction.n_xx:.2f}, $n_{{yy}}$={path.direction.n_yy:.2f}, "
                 f"$n_{{xy}}$={path.direction.n_xy:.2f}, $m_{{xx}}$={path.direction.m_xx:.2f}, "
                 f"$m_{{yy}}$={path.direction.m_yy:.2f}, $m_{{xy}}$={path.direction.m_xy:.2f} "
-                f"(scaled by $\\kappa$)."
+                f"(scaled by load factor $\\lambda$)."
             )
             if n_not_converged:
                 st.caption(
                     f"{n_not_converged} point(s) are best-effort fallbacks (hollow markers) rather than "
-                    "clean corrector convergence - see arclength.py's module docstring."
+                    "clean Newton convergence - see solver.py's module docstring."
                 )
+
+            if curve_diagnosis is not None:
+                with st.container(border=True):
+                    st.markdown(f"**Curve stopped at a diagnosed capacity limit — {_failure_prognosis(curve_diagnosis)}**")
+                    for reason in curve_diagnosis.reasons:
+                        st.markdown(f"- {reason}")
+                    st.caption(
+                        f"Tangent stiffness singular ratio at the last point: "
+                        f"{curve_diagnosis.tangent_singular_ratio:.2e} (near 0 = trending singular)."
+                    )
 
             fig2, axes2 = plt.subplots(1, 3, figsize=(13, 4))
             converged_mask = np.array([p.converged for p in path.points])
 
             for ax, m_vals, kappa_vals, label_m, label_kappa in (
-                (axes2[0], path.m_xx, path.kappa_x * 1000, r"$m_{xx}$ [kNm/m]", r"$\kappa_x$ [mrad/m]"),
-                (axes2[1], path.m_yy, path.kappa_y * 1000, r"$m_{yy}$ [kNm/m]", r"$\kappa_y$ [mrad/m]"),
-                (axes2[2], path.m_xy, path.kappa_xy * 1000, r"$m_{xy}$ [kNm/m]", r"$\kappa_{xy}$ [mrad/m]"),
+                (axes2[0], path.m_xx, path.kappa_x * 1000, r"$m_{xx}$ [kNm/m]", r"$\chi_x$ [mrad/m]"),
+                (axes2[1], path.m_yy, path.kappa_y * 1000, r"$m_{yy}$ [kNm/m]", r"$\chi_y$ [mrad/m]"),
+                (axes2[2], path.m_xy, path.kappa_xy * 1000, r"$m_{xy}$ [kNm/m]", r"$\chi_{xy}$ [mrad/m]"),
             ):
                 ax.plot(kappa_vals, m_vals, "-", color="black", linewidth=0.8)
                 ax.plot(kappa_vals[converged_mask], m_vals[converged_mask], "o", color="black",
@@ -1077,4 +1181,4 @@ with tab_curve:
             fig2.tight_layout()
             st.pyplot(fig2)
         else:
-            st.info("Set the max $\\kappa$/steps and click **Trace M-χ curve**.")
+            st.info("Set the number of points / max load factor and click **Compute load-deformation curve**.")

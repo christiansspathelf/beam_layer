@@ -4,7 +4,9 @@ for tension stiffening of the reinforcement.
 """
 
 from .arclength import MomentCurvaturePath, PathPoint, trace_path
+from .diagnosis import FailureDiagnosis, diagnose_failure
 from .geometry import ReinforcementLayout, ShellParameters
+from .load_sweep import sweep_load_factor
 from .loading import SectionForces
 from .materials.concrete import ConcreteMaterial
 from .materials.steel import SteelMaterial
@@ -31,4 +33,7 @@ __all__ = [
     "PathPoint",
     "MomentCurvaturePath",
     "trace_path",
+    "FailureDiagnosis",
+    "diagnose_failure",
+    "sweep_load_factor",
 ]

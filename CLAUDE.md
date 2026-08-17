@@ -71,6 +71,15 @@ solver.py                 arclength.py
  complex_step.py)           tangent via section.tangent - FD)
         |
 results.py (AnalysisResult / LayerResult)
+        |
+   +----+--------------------+
+   |                         |
+diagnosis.py              load_sweep.py
+(diagnose_failure: is a    (sweep_load_factor: load-controlled
+ converged=False a genuine  alternative to trace_path - scales
+ physical capacity limit    `direction` by an increasing factor,
+ or a numerical stall?)     solve() at each point, stops as soon
+                            as diagnose_failure confirms a limit)
 ```
 
 - **`crack_membrane.py`**: pure function `concrete_stress(eps_x, eps_y, gamma_xy, mat)`.
@@ -87,6 +96,16 @@ results.py (AnalysisResult / LayerResult)
   range; confirmed against `Slab_Solver.m`, not a bug to smooth over). Don't
   "fix" a jump encountered at one of these boundaries by inventing a smoothed
   formula — see the "Authoritative reference" section above.
+  `concrete_stress_batch(eps_x, eps_y, gamma_xy, mat)` is a **vectorized
+  mirror** of the same function (same 6-state branch order, formula-for-
+  formula identical) operating on numpy arrays across all concrete layers
+  at once instead of a Python loop calling `concrete_stress` per layer -
+  pure performance, cross-checked element-by-element against the scalar
+  function in `tests/test_vectorized_constitutive.py`. Branch selection
+  uses `select_ordered` (this module) - a nested-`np.where` first-match-
+  wins helper, not `np.select`: profiling found `np.select`'s own
+  broadcasting overhead dominating runtime at this array size (tens of
+  layers), so this is deliberately not the "obvious" numpy idiom.
 - **`reinforcement.py`**: `panel_response(...)` decides per-panel, per-call
   whether that panel's *own* local strain state has cracked and switches between
   the bare bilinear steel law and the TCM law accordingly — tension stiffening is
@@ -96,6 +115,24 @@ results.py (AnalysisResult / LayerResult)
   integrates stress into force/moment. `LayeredSection.tangent` is a **central
   finite-difference** Jacobian (step `1e-5`, tuned empirically) — still used
   directly by `arclength.py`, but no longer by `solver.solve` (see below).
+  Internally, `internal_forces` (and `_internal_forces_cs` in
+  `complex_step.py`) now call `_concrete_forces_batch`, which evaluates all
+  concrete layers via `crack_membrane.concrete_stress_batch` in one
+  vectorized call rather than a Python loop - profiled as the solver's
+  dominant cost (each Newton iteration does ~15 full internal-forces-
+  equivalent evaluations: 1 residual + 6 complex-step tangent columns + up
+  to 8 line-search trials, all O(n_concrete_layers)). `forces_only(eps0,
+  kappa)` is a **fast F-only path with no per-layer diagnostics**, used by
+  `solver.py`'s hot Newton loop (which never consumes `layer_data`);
+  `internal_forces` still builds the full per-layer `ConcreteStressState`
+  list for callers that need it (GUI, final `AnalysisResult`, one-off
+  calls). Net effect on a representative heavily-cracked case: ~2.8s ->
+  ~1.5s wall-clock, identical convergence/iteration count/residual (see
+  `tests/test_vectorized_constitutive.py`, which cross-checks the
+  vectorized paths against the original scalar formulas - kept intact in
+  `complex_step.py` as an oracle - element-by-element and rebuilds the
+  pre-vectorization tangent from scratch to compare against
+  `tangent_complex_step`'s output).
 - **`complex_step.py`**: `tangent_complex_step`, `solver.solve`'s **default**
   tangent since this session - an exact one-sided derivative via the
   complex-step method (`Im(F(u+ih))/h`, no subtraction, no truncation-vs-
@@ -109,7 +146,19 @@ results.py (AnalysisResult / LayerResult)
   doesn't). Verified independently against hand-derived closed-form elastic
   tangents (matches to 5+ significant figures) - if a future tangent value
   looks wrong, suspect the constitutive branch it's differentiating before
-  suspecting `complex_step.py` itself.
+  suspecting `complex_step.py` itself. `_concrete_stress_cs_batch` is the
+  complex-dtype vectorized mirror used by `_internal_forces_cs` (see
+  `section.py` above) - same 6-state formulas, `select_ordered` for branch
+  choice, and a vectorized complex-safe `atan2` (`_atan2_cs_batch`, built
+  from `np.arctan` on complex arrays rather than looping `cmath.atan` -
+  confirmed to match `cmath.atan` exactly). The original scalar
+  `_concrete_stress_cs` (and its own helpers) is kept, unused by
+  `_internal_forces_cs` now, specifically as the vectorization's regression
+  oracle in `tests/test_vectorized_constitutive.py` - don't delete it as
+  "dead code" without moving what it validates elsewhere first. `_re(x)` is
+  now just `x.real` (Python floats implement `.real` too) - the old
+  `isinstance` branch was ~9.5% of total solve runtime on its own,
+  profiled.
 - **`solver.py` (`solve`)**: targets one load vector. Tries a cheap, bounded
   direct Newton solve at the full target first (`_DIRECT_PROBE_MAX_ITER`,
   skips everything else when it succeeds - typically uncracked/lightly
@@ -149,10 +198,43 @@ results.py (AnalysisResult / LayerResult)
   between very different values at nearly the same `lambda`, 200+ iterations)
   rather than crossing cleanly. Extending complex-step / a similar fix to
   `arclength.py` would be the natural next step, not yet done.
+- **`diagnosis.py`** (`diagnose_failure`): `AnalysisResult.converged=False`
+  alone doesn't say *why* - this could be a genuine physical capacity limit
+  or a numerical/discretization difficulty (see `solver.py`'s module
+  docstring). Generalizes the diagnostic pattern actually used to resolve
+  that ambiguity for the Case 2 pure-torsion investigation (see
+  `shell-layer-torsion-solver-investigation` project memory / `experiments/
+  spathelf2018_validation/NOTES.md`): checks the model's own explicit
+  failure criteria (a concrete layer's `eps2` at/beyond `-eps_c0` - see the
+  "no post-peak softening" note below; reinforcement strain at/beyond
+  `eps_su`), the tangent stiffness's conditioning (near-singular = the
+  mathematical signature of a true limit point), and - optionally
+  (`run_sweep=True`, several extra `solve()` calls) - whether curvature
+  plateaus while the residual grows smoothly across a load sweep, the exact
+  signature observed for Case 2. Returns a `FailureDiagnosis` with a
+  `verdict` and `reasons` - always show both, no single signal here is
+  proof on its own. Read the module docstring before changing the
+  `_TANGENT_SINGULAR_RATIO_THRESHOLD` heuristic - it's not independently
+  calibrated across load cases, just corroborating evidence.
+- **`load_sweep.py`** (`sweep_load_factor`): a **load-controlled**
+  alternative to `trace_path`'s arc-length continuation - scales a given
+  `direction` by an increasing load factor `lambda` (equally spaced,
+  `n_points` of them, up to `max_load_factor`), calling `solve()` at each
+  point (warm-started from the previous one) instead of treating `lambda`
+  as an unknown. Stops early as soon as a point fails to converge *and*
+  `diagnose_failure` (cheap check, no extra solves) confirms a genuine
+  physical limit - a failed point that doesn't look genuine is kept as a
+  best-effort point and the sweep continues. Cannot follow the response
+  *past* a limit point the way arc-length can - but this model has no
+  post-peak softening branch by design (see below), so there's nothing
+  physically meaningful past a genuine limit to follow anyway, making the
+  simpler load-controlled approach an equally valid choice here. This is
+  what the GUI's "Complete load-deformation curve" tab now uses, not
+  `trace_path` - see below.
 - **`gui/app.py`**: Streamlit front end, tabbed — "Single load analysis" and
-  "Complete load-deformation curve" (`trace_path()`). Adds `src/` to
-  `sys.path` manually rather than relying on the editable install. `gui`
-  extras now include `plotly` (was matplotlib-only) - see below.
+  "Complete load-deformation curve". Adds `src/` to `sys.path` manually
+  rather than relying on the editable install. `gui` extras now include
+  `plotly` (was matplotlib-only) - see below.
 
   **Single load analysis**, top to bottom: an always-visible, collapsible
   "3D element geometry (live preview)" expander (`shell_3d_figure` -
@@ -162,16 +244,31 @@ results.py (AnalysisResult / LayerResult)
   `st.success`/`st.error` - those are noticeably taller than the button
   next to them) sharing one row via
   `st.columns(..., vertical_alignment="center")`; the sidebar's loading
-  direction values are used directly as the load (no extra kappa scaling
-  factor - `solve(section, direction, ...)`, `direction` built straight
-  from the sidebar `n_ij`/`m_ij` inputs); then three collapsible result
-  sections (all `expanded=True` by default):
+  direction values are used directly as the load (no extra load-factor
+  scaling - `solve(section, direction, ...)`, `direction` built straight
+  from the sidebar `n_ij`/`m_ij` inputs); on `converged=False`, a cheap
+  `diagnose_failure(section, direction, result, run_sweep=False)` call
+  (one extra tangent eval, no extra solves) runs automatically and its
+  prognosis ("Concrete crushing", "Reinforcement rupture", etc. - see
+  `_failure_prognosis` and `diagnosis.py`) is shown inline in the status
+  badge, with a "Failure diagnostic" expander below listing the full
+  `reasons` and an optional "Run deeper diagnostic" button
+  (`run_sweep=True`, several extra solves) for the load-sweep confirmation
+  check; then three collapsible result sections (all `expanded=True` by
+  default):
   - **"Resulting strain and stress state"**: single-line vector results
     (strains+curvatures merged into one `st.latex` call, unit written
     once; separate lines for reinforcement and concrete principal
     stresses) plus the 5-panel through-thickness figure
     (`cross_section_figure`: eps1, eps2, theta_r, principal concrete
-    stress, reinforcement stress-by-bar).
+    stress, reinforcement stress-by-bar). **Curvature is displayed as
+    $\chi$ (`\chi_x`/`\chi_y`/`\chi_{xy}`), not $\kappa$**, per user
+    preference - a display-only convention in the GUI (this tab and the
+    load-deformation curve tab below). Internal Python identifiers
+    (`kappa`, `kappa_x`, `result.kappa`, `path.kappa_x`, ...) stay named
+    `kappa` throughout the library (matching the MATLAB reference, see
+    "Authoritative reference" above) and are deliberately not part of this
+    renaming - only what's rendered to the user changed.
   - **"Constitutive material law"**: `steel_characteristic_figure` and
     `concrete_characteristic_figure` side by side.
   - **"Crack orientation and spacing"**: `plan_view_figure`, bottom/top
@@ -232,6 +329,24 @@ results.py (AnalysisResult / LayerResult)
   iteration trace across the whole call: probe + incremental steps +
   kicks) is still collected and ready once that's revisited.
 
+  **Complete load-deformation curve** (`tab_curve`) uses
+  `load_sweep.sweep_load_factor`, not `arclength.trace_path` - two
+  sidebar-adjacent controls, "Number of points along the curve"
+  (`curve_n_points`) and "Max load factor $\lambda$" (`curve_max_lambda`),
+  drive an equally-spaced sweep from $\lambda=0$ to `curve_max_lambda`
+  that stops as soon as it hits a `diagnose_failure`-confirmed capacity
+  limit (see `load_sweep.py` above) - the curve may finish with fewer
+  points than requested. The stopping point's prognosis/reasons/tangent
+  ratio are shown in a bordered container under the plot (not the full
+  `_render_failure_diagnostic` expander with its "run deeper diagnostic"
+  button that the single-load tab uses - redundant here, since the sweep
+  *is* already a load sweep). The M-$\chi$ plot itself (`fig2`,
+  matplotlib, 3 subplots for xx/yy/xy) is otherwise unchanged from the
+  `trace_path` era - `MomentCurvaturePath`/`PathPoint` (from `arclength.py`)
+  are reused as `sweep_load_factor`'s return type purely for that
+  plotting-code compatibility, not because this sweep has anything to do
+  with arc-length continuation.
+
   A defensive retry wraps `matplotlib.mathtext.MathTextParser.parse` at
   module load: under Streamlit's threaded execution, the first mathtext
   calls in a process can intermittently raise a spurious `ParseException`
@@ -284,7 +399,10 @@ results.py (AnalysisResult / LayerResult)
   expected model behavior (see `solver.py`/`arclength.py` module docstrings)
   — don't "fix" a `converged=False`, a kink in a traced curve, or an
   unexpectedly nonlinear "elastic" response without first checking whether
-  it's one of these.
+  it's one of these. **`AnalysisResult.converged=False` on its own doesn't
+  say whether that's a genuine physical capacity limit or a numerical/
+  discretization difficulty** - use `diagnosis.diagnose_failure` rather
+  than guessing (see `diagnosis.py` above).
 - **Concrete has no post-peak compression softening branch by design, not
   by omission**: `compression_stress`/State [6] cut off to zero stress the
   instant `|eps2| > eps_c0`, no gradual descent — confirmed to match
