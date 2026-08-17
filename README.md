@@ -72,6 +72,9 @@ python -m venv .venv
 .venv\Scripts\streamlit run gui\app.py
 ```
 
+New to Python or virtual environments? See `STUDENT_SETUP.md` for the
+same steps spelled out in more detail.
+
 ## Status
 
 Core nonlinear layered-section solver, Cracked Membrane Model constitutive
