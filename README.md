@@ -30,6 +30,7 @@ Because cracks rotate freely, shear stress in the principal frame is zero by con
 - `trace_path()` — traces the **full** moment-curvature path via arc-length (Crisfield cylindrical) continuation for a chosen loading direction, scaling it by a load factor `lambda` from zero. Still uses the older finite-difference tangent, not complex-step. See `shell_layer/arclength.py`'s module docstring for the algorithm and its performance characteristics — crossing each cracking transition costs a real sub-solve (~1-3 s), so a curve traced deep into cracking can take real time.
 - `sweep_load_factor()` — a simpler, **load-controlled** alternative for the same purpose: scales a loading direction by an increasing load factor across a chosen number of points, calling `solve()` at each one (warm-started from the previous point) instead of treating the load factor as an unknown. Cannot follow the response *past* a genuine capacity limit the way arc-length can, but this model has no post-peak softening branch (see below), so there's nothing physically meaningful past a limit to follow anyway. Stops automatically once `diagnose_failure()` confirms it has reached one. This is what the GUI's "Complete load-deformation curve" tab uses.
 - `diagnose_failure()` — for a `solve()` result with `converged=False`, distinguishes a genuine physical capacity limit (concrete crushing, reinforcement rupture, a tangent stiffness trending singular) from a numerical/discretization difficulty, rather than leaving `converged=False` ambiguous. See `shell_layer/diagnosis.py`'s module docstring.
+- `find_ultimate_load()` — finds the **ultimate load factor** for a loading direction (the largest scaling the section can carry) via bracket-then-bisect: one cheap coarse `sweep_load_factor()` pass to bracket a genuine capacity limit, then bisection to refine it to a chosen tolerance (default 1%) - typically ~15-20 `solve()` calls total, regardless of how far out the true capacity is. Reports the governing failure mechanism alongside it via `diagnose_failure()`. This is what the GUI's "Traglastberechnung" tab uses.
 
 ## Configurable parameters
 
@@ -57,6 +58,7 @@ src/shell_layer/
     arclength.py           Full moment-curvature path tracing: arc-length continuation
     load_sweep.py           Load-controlled path tracing: sweep_load_factor()
     diagnosis.py             Genuine capacity limit vs. numerical stall: diagnose_failure()
+    ultimate_load.py          Ultimate load factor via bracket-then-bisect: find_ultimate_load()
     results.py            AnalysisResult / LayerResult containers
 gui/
     app.py                Streamlit GUI: parameter input, 3D preview, through-thickness/

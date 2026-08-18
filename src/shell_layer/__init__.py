@@ -14,6 +14,7 @@ from .reinforcement import BarDepths, ReinforcementPanel, individual_bar_depths
 from .results import AnalysisResult, LayerResult
 from .section import LayeredSection
 from .solver import solve
+from .ultimate_load import UltimateLoadResult, find_ultimate_load
 
 __version__ = "0.3.0"
 
@@ -36,4 +37,6 @@ __all__ = [
     "FailureDiagnosis",
     "diagnose_failure",
     "sweep_load_factor",
+    "UltimateLoadResult",
+    "find_ultimate_load",
 ]

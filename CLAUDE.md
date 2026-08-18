@@ -79,7 +79,14 @@ diagnosis.py              load_sweep.py
  converged=False a genuine  alternative to trace_path - scales
  physical capacity limit    `direction` by an increasing factor,
  or a numerical stall?)     solve() at each point, stops as soon
-                            as diagnose_failure confirms a limit)
+        |                   as diagnose_failure confirms a limit)
+        |                           |
+        +-------------+-------------+
+                       |
+                ultimate_load.py
+        (find_ultimate_load: bracket-then-bisect
+         on top of sweep_load_factor + diagnose_failure -
+         the ultimate load factor kappa_u to a chosen tolerance)
 ```
 
 - **`crack_membrane.py`**: pure function `concrete_stress(eps_x, eps_y, gamma_xy, mat)`.
@@ -230,17 +237,58 @@ diagnosis.py              load_sweep.py
   physically meaningful past a genuine limit to follow anyway, making the
   simpler load-controlled approach an equally valid choice here. This is
   what the GUI's "Complete load-deformation curve" tab now uses, not
-  `trace_path` - see below.
-- **`gui/app.py`**: Streamlit front end, tabbed — "Single load analysis" and
-  "Complete load-deformation curve". Adds `src/` to `sys.path` manually
+  `trace_path` - see below. Internal identifiers here (`PathPoint.lam`,
+  the `lambda` in docstrings/parameter names) stay `lambda`, matching
+  `arclength.py`'s own naming - the GUI displays this same factor as
+  $\kappa$ (see below), a display-only choice, not a library rename.
+- **`ultimate_load.py`** (`find_ultimate_load`): finds the **ultimate**
+  load factor for a given `direction` - the largest scaling the section
+  can carry - via **bracket-then-bisect**, not a fine linear sweep: calls
+  `sweep_load_factor` once with only a handful of points (`n_bracket_
+  points`, default 7) to cheaply get *some* diagnosed failure point and
+  bracket the ultimate load between the last-converged and first-failed
+  factor, then bisects that bracket (each step halves the uncertainty)
+  until it's within `rel_tol` (default 1%) of `kappa_hi`. Reports
+  `kappa_u` as the **last confirmed-converged** factor (a safe lower
+  bound, not the bracket's midpoint or its failing upper end) plus the
+  `FailureDiagnosis` at the bracket's failing end - same governing-
+  mechanism classification (concrete crushing / reinforcement rupture /
+  near-singular tangent) as `diagnosis.py`. ~15-20 `solve()` calls total
+  regardless of how far out the true capacity is - verified against the
+  Case 2 pure-torsion investigation's independently-known ~76.3 kNm/m
+  capacity in `tests/test_ultimate_load.py`. This is what the GUI's
+  "Traglastberechnung" tab uses.
+- **`gui/app.py`**: Streamlit front end, tabbed — "Single load analysis",
+  "Complete load-deformation curve", and "Traglastberechnung". Adds
+  `src/` to `sys.path` manually
   rather than relying on the editable install. `gui` extras now include
   `plotly` (was matplotlib-only) - see below.
 
   **Single load analysis**, top to bottom: an always-visible, collapsible
-  "3D element geometry (live preview)" expander (`shell_3d_figure` -
-  translucent green concrete box + blue rebar tubes at each bar's true
-  individual depth + a small x/y/z coordinate triad, built with
-  Plotly/WebGL); run button + a compact inline status badge (not
+  "3D element geometry (live preview)" expander with three side-by-side
+  plots - `shell_3d_figure` (translucent green concrete box + blue rebar
+  tubes at each bar's true individual depth + a small x/y/z coordinate
+  triad, built with Plotly/WebGL), `concrete_discretization_figure` (the
+  plain concrete sub-layer split, no rebar), and `sandwich_model_figure`
+  ("Reinforced concrete panel covers" - the real cover-element/core split
+  from `build_reinforcement_panels`, x-direction bars as a horizontal
+  band seen from the side, y-direction bars as roundels seen end-on at
+  their real spacing). The latter two are elevations (x right, z down)
+  with a deliberately small, non-1:1-locked x-window so the through-
+  thickness detail stays readable - a literal 1:1 aspect made the layers
+  unreadably thin. **Bar sizing in both elevations is drawn via
+  `add_shape` rects/circles sized in the plot's own data units (mm), not
+  `line.width`/`marker.size`** (Plotly always renders those in screen
+  pixels, so a bar drawn that way stayed visually the same size
+  regardless of the actual sidebar diameter or section zoom level - found
+  and fixed as a real bug, confirmed offline by checking a rendered
+  shape's height scales 1:1 with the diameter input). The y-direction roundels render
+  as slightly elongated ellipses rather than perfect circles, a direct
+  consequence of the deliberately non-1:1 aspect - their z-extent (bar
+  diameter vs. cover/thickness, the dimension that actually matters here)
+  is exactly to scale regardless.
+
+  Below that: run button + a compact inline status badge (not
   `st.success`/`st.error` - those are noticeably taller than the button
   next to them) sharing one row via
   `st.columns(..., vertical_alignment="center")`; the sidebar's loading
@@ -332,8 +380,8 @@ diagnosis.py              load_sweep.py
   **Complete load-deformation curve** (`tab_curve`) uses
   `load_sweep.sweep_load_factor`, not `arclength.trace_path` - two
   sidebar-adjacent controls, "Number of points along the curve"
-  (`curve_n_points`) and "Max load factor $\lambda$" (`curve_max_lambda`),
-  drive an equally-spaced sweep from $\lambda=0$ to `curve_max_lambda`
+  (`curve_n_points`) and "Max load factor $\kappa$" (`curve_max_kappa`),
+  drive an equally-spaced sweep from $\kappa=0$ to `curve_max_kappa`
   that stops as soon as it hits a `diagnose_failure`-confirmed capacity
   limit (see `load_sweep.py` above) - the curve may finish with fewer
   points than requested. The stopping point's prognosis/reasons/tangent
@@ -345,7 +393,32 @@ diagnosis.py              load_sweep.py
   `trace_path` era - `MomentCurvaturePath`/`PathPoint` (from `arclength.py`)
   are reused as `sweep_load_factor`'s return type purely for that
   plotting-code compatibility, not because this sweep has anything to do
-  with arc-length continuation.
+  with arc-length continuation. **Load factor is displayed as $\kappa$
+  here too**, not $\lambda$ (the internal name, matching `arclength.py` -
+  see `load_sweep.py` above) - originally shipped as $\lambda$, renamed
+  to $\kappa$ per user request to match the "Traglastberechnung" tab
+  below's own convention (a standard symbol for the load multiplier in
+  ultimate-load analysis), once it became clear that's what "kappa" in
+  the user's own phrasing had meant all along - not a naming bug to fix
+  back.
+
+  **Traglastberechnung** (`tab_ultimate`, `ultimate_load.find_ultimate_load`):
+  finds the ultimate load factor $\kappa_u$ for the sidebar's loading
+  direction and reports the governing failure mechanism - see
+  `ultimate_load.py` above for the bracket-then-bisect algorithm. Two
+  controls: "Max $\kappa$ to search up to" (`ultimate_max_kappa`, the
+  bracket search's upper bound - returns `None`/a warning if no limit is
+  found by then, telling the user to raise it) and "Precision" (`ultimate_
+  tol_pct`, percent of $\kappa_u$, default 1%, passed straight through as
+  `rel_tol`). Result shown in a bordered container: $\kappa_u$, the same
+  `_failure_prognosis`/`reasons` text as the other two tabs' diagnostics,
+  the final bracket width and total solve count (so the user can see how
+  cheap the search actually was), and the achieved force/moment vector at
+  $\kappa_u$ in the same `st.latex` vector style used elsewhere. Does not
+  reuse `_render_failure_diagnostic`'s "run deeper diagnostic" button -
+  same reasoning as the curve tab, this search already *is* a refined
+  sweep, and `UltimateLoadResult` doesn't retain the bracket's failing
+  `AnalysisResult` that button would need anyway.
 
   A defensive retry wraps `matplotlib.mathtext.MathTextParser.parse` at
   module load: under Streamlit's threaded execution, the first mathtext

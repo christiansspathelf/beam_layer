@@ -27,6 +27,7 @@ from shell_layer import (  # noqa: E402
     ShellParameters,
     SteelMaterial,
     diagnose_failure,
+    find_ultimate_load,
     individual_bar_depths,
     solve,
     sweep_load_factor,
@@ -330,14 +331,20 @@ def sandwich_model_figure(params: ShellParameters) -> go.Figure:
     concrete green, and the plain concrete core between them in light
     grey, with no reinforcement. Within each cover band, the x-direction
     bars (running along the view's own x-axis) are drawn as a horizontal
-    line, while the y-direction bars (running into/out of the page) are
-    drawn as dots at their real spacing - this is a real projection
+    band, while the y-direction bars (running into/out of the page) are
+    drawn as roundels at their real spacing - this is a real projection
     difference, not an arbitrary style choice: a bar running in the
     view's own plane reads as a line seen from the side, one running
-    perpendicular to it reads as a point seen end-on. A dashed line at
+    perpendicular to it reads as a point seen end-on. Both are drawn as
+    `add_shape` rects/circles sized in the plot's own data units (mm), not
+    `line.width`/`marker.size` (always screen pixels in Plotly, so they'd
+    stay visually the same size regardless of the actual bar diameter or
+    of how zoomed-in the section is) - so a diameter change in the
+    sidebar is reflected live and true-to-scale against the surrounding
+    concrete geometry, not just in a tooltip/number. A dashed line at
     each panel's smeared depth (z_B/z_T) marks the single depth the
     solver actually evaluates that panel's stress at - distinct from the
-    true individual bar depths the line/dots are drawn at."""
+    true individual bar depths the bands/roundels are drawn at."""
     h_mm = params.thickness * 1000
     bottom_panel, top_panel = build_reinforcement_panels(params)
     depths = individual_bar_depths(params)
@@ -360,24 +367,31 @@ def sandwich_model_figure(params: ShellParameters) -> go.Figure:
         fig.add_annotation(x=-x_half_extent, y=panel_z_mm, text=label, showarrow=False,
                            font=dict(size=9, color="white"), xanchor="left", yanchor="bottom", xshift=4)
 
-    # x-direction bars: lines (seen from the side, running along the plot's own x-axis).
+    # x-direction bars: a band seen from the side, running along the plot's
+    # own x-axis - drawn as a rect of true height `diam_mm` in data units
+    # (mm) so it scales live and to-scale with the sidebar's diameter input,
+    # not a fixed-in-pixels line width.
     for z_mm, diam_mm in ((depths.z_xB * 1000, params.bottom_x.bar_diameter),
                           (depths.z_xT * 1000, params.top_x.bar_diameter)):
-        fig.add_shape(type="line", x0=-1000, x1=1000, y0=z_mm, y1=z_mm, layer="above",
-                      line=dict(color="royalblue", width=max(diam_mm / 3, 2)))
-    # y-direction bars: dots at their real spacing (seen end-on, into/out of the page).
+        half_d = diam_mm / 2.0
+        fig.add_shape(type="rect", x0=-1000, x1=1000, y0=z_mm - half_d, y1=z_mm + half_d, layer="above",
+                      fillcolor="royalblue", line=dict(width=0))
+    # y-direction bars: roundels at their real spacing (seen end-on, into/out
+    # of the page) - drawn as circles of true diameter `diam_mm` in data
+    # units for the same live-scaling reason (the plot's x/y axes aren't
+    # 1:1 - see _elevation_axes - so these render as ellipses, not
+    # perfect circles, but their z-extent, the dimension that actually
+    # matters here against cover/thickness, is exactly to scale).
     for z_mm, spacing_mm, diam_mm in ((depths.z_yB * 1000, params.bottom_y.spacing, params.bottom_y.bar_diameter),
                                        (depths.z_yT * 1000, params.top_y.spacing, params.top_y.bar_diameter)):
-        xs = bar_positions(spacing_mm) * 1000
-        fig.add_trace(go.Scatter(
-            x=xs, y=[z_mm] * len(xs), mode="markers",
-            marker=dict(size=max(diam_mm / 2.5, 6), color="royalblue", line=dict(color="white", width=0.8)),
-            hoverinfo="skip", showlegend=False,
-        ))
+        half_d = diam_mm / 2.0
+        for x_mm in bar_positions(spacing_mm) * 1000:
+            fig.add_shape(type="circle", x0=x_mm - half_d, x1=x_mm + half_d, y0=z_mm - half_d, y1=z_mm + half_d,
+                          layer="above", fillcolor="royalblue", line=dict(color="white", width=0.8))
 
     _elevation_axes(fig, h_mm, x_half_extent)
     fig.update_layout(
-        title=dict(text="Sandwich model (cover elements + core)", x=0.5, xanchor="center", font=dict(size=12)),
+        title=dict(text="Reinforced concrete panel covers", x=0.5, xanchor="center", font=dict(size=12)),
         margin=dict(l=50, r=10, t=30, b=35), height=340, showlegend=False,
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
     )
@@ -868,7 +882,9 @@ def _render_failure_diagnostic(section, forces, result, diagnosis: FailureDiagno
     return diagnosis
 
 
-tab_single, tab_curve = st.tabs(["Single load analysis", "Complete load-deformation curve"])
+tab_single, tab_curve, tab_ultimate = st.tabs(
+    ["Single load analysis", "Complete load-deformation curve", "Traglastberechnung"]
+)
 
 with tab_single:
     if direction_norm == 0:
@@ -1096,7 +1112,7 @@ with tab_curve:
     else:
         st.caption(
             "Scales the sidebar's loading direction by an increasing load "
-            "factor $\\lambda$ ($\\lambda=1$ is exactly the sidebar's "
+            "factor $\\kappa$ ($\\kappa=1$ is exactly the sidebar's "
             "specified load) and solves each point directly with the "
             "damped-Newton solver, warm-started from the previous point - "
             "simpler than arc-length continuation, and just as valid here "
@@ -1109,15 +1125,15 @@ with tab_curve:
         with curve_col1:
             curve_n_points = st.slider("Number of points along the curve", min_value=3, max_value=60, value=15)
         with curve_col2:
-            curve_max_lambda = st.number_input(
-                r"Max load factor $\lambda$ ($\lambda=1$ = sidebar's specified load)",
+            curve_max_kappa = st.number_input(
+                r"Max load factor $\kappa$ ($\kappa=1$ = sidebar's specified load)",
                 min_value=0.1, value=2.0, step=0.1,
             )
         st.caption(
             "The sweep stops as soon as a point is diagnosed as a genuine "
             "capacity limit, so it may finish with fewer points than "
             "requested - increase the max load factor if it reaches "
-            "$\\lambda_{max}$ without failing and you want to push further."
+            "$\\kappa_{max}$ without failing and you want to push further."
         )
         trace = st.button("Compute load-deformation curve", type="primary")
 
@@ -1125,7 +1141,7 @@ with tab_curve:
             section = LayeredSection(params, concrete, steel, tension_stiffening=tension_stiffening,
                                       n_concrete_layers=n_concrete_layers)
             with st.spinner(f"Solving up to {curve_n_points} load levels..."):
-                path, curve_diagnosis = sweep_load_factor(section, direction, curve_n_points, curve_max_lambda)
+                path, curve_diagnosis = sweep_load_factor(section, direction, curve_n_points, curve_max_kappa)
             st.session_state["path"] = path
             st.session_state["curve_diagnosis"] = curve_diagnosis
 
@@ -1139,7 +1155,7 @@ with tab_curve:
                 f"$n_{{xx}}$={path.direction.n_xx:.2f}, $n_{{yy}}$={path.direction.n_yy:.2f}, "
                 f"$n_{{xy}}$={path.direction.n_xy:.2f}, $m_{{xx}}$={path.direction.m_xx:.2f}, "
                 f"$m_{{yy}}$={path.direction.m_yy:.2f}, $m_{{xy}}$={path.direction.m_xy:.2f} "
-                f"(scaled by load factor $\\lambda$)."
+                f"(scaled by load factor $\\kappa$)."
             )
             if n_not_converged:
                 st.caption(
@@ -1182,3 +1198,75 @@ with tab_curve:
             st.pyplot(fig2)
         else:
             st.info("Set the number of points / max load factor and click **Compute load-deformation curve**.")
+
+with tab_ultimate:
+    if direction_norm == 0:
+        st.error("Set a nonzero loading direction in the sidebar.")
+    else:
+        st.caption(
+            "Finds the ultimate load factor $\\kappa_u$ - the largest "
+            "scaling of the sidebar's loading direction the section can "
+            "carry - via bracket-then-bisect: a cheap coarse sweep (the "
+            "same mechanism as the load-deformation curve tab) brackets a "
+            "genuine capacity limit, then bisection refines $\\kappa_u$ to "
+            "the chosen precision in a handful more solves - far fewer "
+            "than a fine linear sweep would need for comparable "
+            "precision. Also reports the governing failure mechanism "
+            "(concrete crushing or reinforcement rupture)."
+        )
+        ult_col1, ult_col2 = st.columns(2)
+        with ult_col1:
+            ultimate_max_kappa = st.number_input(
+                r"Max $\kappa$ to search up to ($\kappa=1$ = sidebar's specified load)",
+                min_value=0.1, value=5.0, step=0.5,
+            )
+        with ult_col2:
+            ultimate_tol_pct = st.slider(
+                r"Precision [% of $\kappa_u$]", min_value=0.1, max_value=5.0, value=1.0, step=0.1,
+            )
+        find_ultimate = st.button("Traglast berechnen", type="primary")
+
+        if find_ultimate:
+            section = LayeredSection(params, concrete, steel, tension_stiffening=tension_stiffening,
+                                      n_concrete_layers=n_concrete_layers)
+            with st.spinner("Bracketing and refining the ultimate load factor..."):
+                ultimate_result = find_ultimate_load(
+                    section, direction, max_kappa=ultimate_max_kappa, rel_tol=ultimate_tol_pct / 100.0
+                )
+            st.session_state["ultimate_result"] = ultimate_result
+            st.session_state["ultimate_direction"] = direction
+            st.session_state["ultimate_max_kappa"] = ultimate_max_kappa
+
+        if "ultimate_result" in st.session_state:
+            ultimate_result = st.session_state["ultimate_result"]
+            ultimate_direction = st.session_state["ultimate_direction"]
+
+            if ultimate_result is None:
+                st.warning(
+                    f"No capacity limit found up to $\\kappa$={st.session_state['ultimate_max_kappa']:.2f} "
+                    "- increase the max search range."
+                )
+            else:
+                target = ultimate_direction.to_vector()
+                n_xx_u, n_yy_u, n_xy_u, m_xx_u, m_yy_u, m_xy_u = target * ultimate_result.kappa_u
+
+                with st.container(border=True):
+                    st.markdown(f"### $\\kappa_u = {ultimate_result.kappa_u:.3f}$")
+                    st.markdown(f"**{_failure_prognosis(ultimate_result.diagnosis)}**")
+                    for reason in ultimate_result.diagnosis.reasons:
+                        st.markdown(f"- {reason}")
+                    st.caption(
+                        f"Bracket: $\\kappa \\in [{ultimate_result.kappa_lo:.4f},\\ "
+                        f"{ultimate_result.kappa_hi:.4f}]$ — {ultimate_result.n_solves} solves total."
+                    )
+
+                st.latex(
+                    r"[n_{xx},\ n_{yy},\ n_{xy}]="
+                    r"[%.2f,\ %.2f,\ %.2f]\,\text{kN/m}"
+                    r"\qquad"
+                    r"[m_{xx},\ m_{yy},\ m_{xy}]="
+                    r"[%.2f,\ %.2f,\ %.2f]\,\text{kNm/m}"
+                    % (n_xx_u, n_yy_u, n_xy_u, m_xx_u, m_yy_u, m_xy_u)
+                )
+        else:
+            st.info("Set the max $\\kappa$ / precision and click **Traglast berechnen**.")
