@@ -45,10 +45,20 @@ def build_rebar_rows(params: BeamParameters) -> Tuple[RebarRow, RebarRow]:
     b_mm = params.width * 1000.0
 
     def make(face: RebarFace, z: float) -> RebarRow:
-        cover_element_mm = 2.0 * (params.cover * 1000.0 + params.stirrup_diameter + face.diameter / 2.0)
-        rho = face.area_total_mm2 / (b_mm * cover_element_mm)
-        s_rm0 = face.diameter * (1 - rho) / (4 * rho)
-        return RebarRow(z=z, diameter=face.diameter, area_total_mm2=face.area_total_mm2, s_rm0=s_rm0)
+        area = face.area_total_mm2
+        if area <= 0.0:
+            # No reinforcement on this face (n_bars=0 and/or diameter=0, per a user
+            # request) - rho would be 0 and s_rm0's formula divides by it, so there's
+            # no meaningful crack spacing to compute. The placeholder value is never
+            # actually used: with area=0, this row's force contribution is zero
+            # regardless of tension_stiffening (see section.py), so s_rm0 only needs
+            # to be *some* finite float, not a physically meaningful one.
+            s_rm0 = 0.0
+        else:
+            cover_element_mm = 2.0 * (params.cover * 1000.0 + params.stirrup_diameter + face.diameter / 2.0)
+            rho = area / (b_mm * cover_element_mm)
+            s_rm0 = face.diameter * (1 - rho) / (4 * rho)
+        return RebarRow(z=z, diameter=face.diameter, area_total_mm2=area, s_rm0=s_rm0)
 
     bottom = make(params.bottom, params.z_bottom)
     top = make(params.top, params.z_top)

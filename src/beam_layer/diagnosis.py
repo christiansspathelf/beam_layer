@@ -87,6 +87,11 @@ def diagnose_failure(
 
     reinforcement_ruptured = False
     for row in (section.bottom_row, section.top_row):
+        if row.area_total_mm2 <= 0.0:
+            # No reinforcement on this face (per a user request to allow n_bars=0/
+            # diameter=0) - there's no real bar here to rupture, only the phantom
+            # strain a bar *would* have at this depth.
+            continue
         e = strain_at(row.z, result.eps0, result.kappa)
         if abs(e) >= section.steel.eps_su:
             reinforcement_ruptured = True

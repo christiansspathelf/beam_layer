@@ -11,11 +11,25 @@ def test_bar_area_and_total_area():
     assert face.area_total_mm2 == pytest.approx(3 * math.pi * 16.0**2 / 4.0)
 
 
-def test_rebar_face_rejects_nonpositive_values():
+def test_rebar_face_rejects_negative_values():
     with pytest.raises(ValueError):
-        RebarFace(n_bars=0, diameter=16.0)
+        RebarFace(n_bars=-1, diameter=16.0)
     with pytest.raises(ValueError):
-        RebarFace(n_bars=3, diameter=0.0)
+        RebarFace(n_bars=3, diameter=-1.0)
+
+
+def test_rebar_face_allows_zero_bars_or_zero_diameter_as_no_reinforcement():
+    # Per a user request: n_bars=0 or diameter=0 (or both) is a valid way to say
+    # "no reinforcement on this face" - both give area_total_mm2 == 0.
+    assert RebarFace(n_bars=0, diameter=16.0).area_total_mm2 == 0.0
+    assert RebarFace(n_bars=3, diameter=0.0).area_total_mm2 == 0.0
+    assert RebarFace(n_bars=0, diameter=0.0).area_total_mm2 == 0.0
+
+
+def test_bar_y_positions_empty_for_zero_bars():
+    face = RebarFace(n_bars=0, diameter=16.0)
+    params = BeamParameters(height=0.4, width=0.3, cover=0.03, stirrup_diameter=8.0, bottom=face, top=face)
+    assert len(bar_y_positions_mm(face, params)) == 0
 
 
 def test_beam_parameters_rejects_bad_geometry():

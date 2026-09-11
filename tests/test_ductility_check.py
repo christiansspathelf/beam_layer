@@ -82,6 +82,18 @@ def test_limit_scales_inversely_with_f_yd(params):
     assert result.limit == pytest.approx(0.35 * 435.0 / 610.0)
 
 
+def test_returns_none_when_tension_face_has_no_reinforcement(steel):
+    """Per a user request to allow n_bars=0/diameter=0: without reinforcement on the
+    tension face, "does it yield before the concrete crushes" isn't a meaningful
+    question - the check should say "not applicable", not report a bogus ratio."""
+    params = BeamParameters(
+        height=0.4, width=0.3, cover=0.03, stirrup_diameter=8.0,
+        bottom=RebarFace(0, 16.0), top=RebarFace(2, 12.0),
+    )
+    # kappa > 0 puts the bottom (unreinforced) face in tension.
+    assert compression_zone_check(params, steel, eps0=0.0002, kappa=0.01) is None
+
+
 def test_solved_result_gives_ratio_below_limit_for_a_lightly_loaded_beam(params, concrete, steel):
     """Regression/sanity guard using an actual solve() result, not just
     hand-picked (eps0, kappa)."""

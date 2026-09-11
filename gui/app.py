@@ -169,12 +169,13 @@ def rebar_face_input(face: str, default_n: int, default_diam: float) -> RebarFac
     """face: 'inf' (bottom) or 'sup' (top)."""
     col1, col2 = st.columns(2)
     n = col1.number_input(
-        rf"Anzahl Stäbe $n_{{s,\mathrm{{{face}}}}}$ [-]", min_value=1, max_value=20, value=default_n, step=1,
-        key=f"{face}_n",
+        rf"Anzahl Stäbe $n_{{s,\mathrm{{{face}}}}}$ [-]", min_value=0, max_value=20, value=default_n, step=1,
+        key=f"{face}_n", help="0 = keine Bewehrung auf dieser Seite",
     )
     diam = col2.number_input(
-        rf"Durchmesser $\varnothing_{{s,\mathrm{{{face}}}}}$ [mm]", min_value=6.0, max_value=40.0,
+        rf"Durchmesser $\varnothing_{{s,\mathrm{{{face}}}}}$ [mm]", min_value=0.0, max_value=40.0,
         value=default_diam, step=1.0, format="%.0f", key=f"{face}_diam",
+        help="0 = keine Bewehrung auf dieser Seite",
     )
     return RebarFace(n_bars=int(n), diameter=diam)
 
@@ -328,6 +329,10 @@ def combined_geometry_figure(params: BeamParameters, n_x: float, m_y: float,
     fig.add_shape(type="rect", x0=0, x1=length_mm, y0=-h_mm / 2, y1=h_mm / 2, layer="below",
                   fillcolor="seagreen", opacity=0.28, line=dict(color="white", width=1), row=1, col=2)
     for face, z_mm in ((params.bottom, params.z_bottom * 1000.0), (params.top, params.z_top * 1000.0)):
+        if face.area_total_mm2 <= 0.0:
+            # No reinforcement on this face (n_bars=0/diameter=0, per a user request) -
+            # don't draw a bar line implying one is there.
+            continue
         fig.add_shape(type="line", x0=0, x1=length_mm, y0=z_mm, y1=z_mm, layer="above",
                       line=dict(color="royalblue", width=max(2.0, face.diameter / 3.0)), row=1, col=2)
     y_leg_top, y_leg_bottom = -h_mm / 2 + cover_mm, h_mm / 2 - cover_mm
@@ -550,6 +555,10 @@ def beam_elevation_figure(params: BeamParameters, n_x: float, m_y: float,
                   fillcolor="seagreen", opacity=0.28, line=dict(color="white", width=1))
 
     for face, z_mm in ((params.bottom, params.z_bottom * 1000.0), (params.top, params.z_top * 1000.0)):
+        if face.area_total_mm2 <= 0.0:
+            # No reinforcement on this face (n_bars=0/diameter=0, per a user request) -
+            # don't draw a bar line implying one is there.
+            continue
         fig.add_shape(type="line", x0=0, x1=length_mm, y0=z_mm, y1=z_mm, layer="above",
                       line=dict(color="royalblue", width=max(2.0, face.diameter / 3.0)))
 
@@ -783,14 +792,18 @@ def strain_stress_figure(section: LayeredBeamSection, eps0: float, kappa: float)
     sigma = np.array([s.sigma for _, s in concrete_entries])
 
     h_mm = section.params.height * 1000
-    bar_z_mm = np.array([section.bottom_row.z, section.top_row.z]) * 1000
-    bar_sigma = np.array([bottom_resp.sigma, top_resp.sigma])
-    bar_diam_mm = np.array([section.bottom_row.diameter, section.top_row.diameter])
-    bar_eps = np.array([
-        strain_at(section.bottom_row.z, eps0, kappa) * 1000,
-        strain_at(section.top_row.z, eps0, kappa) * 1000,
-    ])
-    bar_labels = ["inf", "sup"]
+    # Only rows with actual reinforcement (area_total_mm2 > 0) get a marker/bar here -
+    # a face configured with n_bars=0/diameter=0 (per a user request to allow "no
+    # reinforcement") has no real bar to show, even though row_response still returns
+    # a well-defined material-law stress at its (fictitious) strain.
+    all_rows = [(section.bottom_row, bottom_resp, "inf"), (section.top_row, top_resp, "sup")]
+    reinforced_rows = [(row, resp, label) for row, resp, label in all_rows if row.area_total_mm2 > 0.0]
+    bar_z_mm = np.array([row.z for row, _, _ in reinforced_rows]) * 1000
+    bar_sigma = np.array([resp.sigma for _, resp, _ in reinforced_rows])
+    bar_diam_mm = np.array([row.diameter for row, _, _ in reinforced_rows])
+    bar_eps = np.array([strain_at(row.z, eps0, kappa) * 1000 for row, _, _ in reinforced_rows])
+    bar_labels = [label for _, _, label in reinforced_rows]
+    bar_symbols = ["circle" if label == "inf" else "square" for label in bar_labels]
 
     fig = make_subplots(rows=1, cols=2, shared_yaxes=True, horizontal_spacing=0.06,
                          subplot_titles=["ε(z)", "σ(z)"])
@@ -809,7 +822,7 @@ def strain_stress_figure(section: LayeredBeamSection, eps0: float, kappa: float)
     ), row=1, col=1)
     fig.add_trace(go.Scatter(
         x=bar_eps, y=bar_z_mm, mode="markers", showlegend=False,
-        marker=dict(symbol=["circle", "square"], size=9, color="white", line=dict(color="black", width=1.6)),
+        marker=dict(symbol=bar_symbols, size=9, color="white", line=dict(color="black", width=1.6)),
         text=bar_labels, hovertemplate="%{text}<br>ε_s=%{x:.3f}‰<extra></extra>",
     ), row=1, col=1)
 

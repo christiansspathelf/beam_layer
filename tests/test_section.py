@@ -210,3 +210,24 @@ def test_complex_step_mirror_includes_the_same_net_force_correction(section):
     F_cs = _internal_forces_cs(section, complex(eps0), complex(kappa))
     assert F_cs.real == pytest.approx(F_real, rel=1e-9)
     assert F_cs.imag == pytest.approx(np.zeros(2))
+
+
+def test_zero_reinforcement_face_contributes_no_force_and_does_not_crash(concrete, steel):
+    """Per a user request: n_bars=0 (or diameter=0) on either face must run cleanly -
+    a plain-concrete-only section, or one reinforced on only one face. The zero-area
+    row must contribute exactly zero force/moment, not NaN/inf (the crack-spacing
+    formula's rho=0 division - see reinforcement.build_rebar_rows - is the one place
+    that would otherwise blow up)."""
+    params = BeamParameters(
+        height=0.4, width=0.3, cover=0.03, stirrup_diameter=8.0,
+        bottom=RebarFace(0, 16.0), top=RebarFace(3, 0.0),  # both faces "no reinforcement"
+    )
+    section = LayeredBeamSection(params, concrete, steel, tension_stiffening=False, n_concrete_layers=20)
+    F, layer_data = section.internal_forces(-0.0015, 0.003)
+    assert np.all(np.isfinite(F))
+    reinforcement_resp = [s for kind, _, s in layer_data if kind == "reinforcement"]
+    assert len(reinforcement_resp) == 2  # both rows still exist, just with zero area
+
+    fr = section.force_resultants(-0.0015, 0.003)
+    assert fr.bottom_steel_force == 0.0
+    assert fr.top_steel_force == 0.0

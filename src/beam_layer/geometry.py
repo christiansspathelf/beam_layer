@@ -22,18 +22,30 @@ import numpy as np
 class RebarFace:
     """A single row of identical longitudinal bars on one face (bottom/top).
 
-    n_bars: number of bars in the row [-]
-    diameter: bar diameter [mm]
+    n_bars: number of bars in the row [-] (0 = no reinforcement on this face)
+    diameter: bar diameter [mm] (0 = no reinforcement on this face)
+
+    Either `n_bars=0` or `diameter=0` (or both) makes `area_total_mm2 == 0`,
+    per a user request to be able to run an analysis with no reinforcement
+    on one or both faces - e.g. a plain-concrete check, or isolating the
+    other face's contribution. The rest of the pipeline (`build_rebar_rows`,
+    `LayeredBeamSection`) already handles a zero-area row correctly (its
+    force contribution is naturally zero); only a handful of places that
+    divide by area or assume "a row means a real bar" needed an explicit
+    guard - see `reinforcement.build_rebar_rows`, `diagnosis.
+    diagnose_failure`, `load_sweep._hard_criteria_tripped`, `curve_landmarks.
+    _find_first_yield`, `ductility_check.compression_zone_check`, and
+    `gui/app.py`'s reinforcement drawing/marker code.
     """
 
     n_bars: int
     diameter: float
 
     def __post_init__(self) -> None:
-        if self.n_bars < 1:
-            raise ValueError("n_bars must be >= 1")
-        if self.diameter <= 0:
-            raise ValueError("diameter must be positive")
+        if self.n_bars < 0:
+            raise ValueError("n_bars must be >= 0 (0 means no reinforcement on this face)")
+        if self.diameter < 0:
+            raise ValueError("diameter must be >= 0 (0 means no reinforcement on this face)")
 
     @property
     def bar_area_mm2(self) -> float:
@@ -118,6 +130,8 @@ def bar_y_positions_mm(face: RebarFace, params: BeamParameters) -> np.ndarray:
     just in the horizontal direction). The solver itself has no use for
     y-position: a beam layer's stress only depends on depth z.
     """
+    if face.n_bars == 0:
+        return np.array([])
     b_mm = params.width * 1000.0
     edge_mm = params.cover * 1000.0 + params.stirrup_diameter + face.diameter / 2.0
     half_span = b_mm / 2.0 - edge_mm

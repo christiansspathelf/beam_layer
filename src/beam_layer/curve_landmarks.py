@@ -171,20 +171,25 @@ def find_curve_landmarks(
 
 def _find_first_yield(section: LayeredBeamSection, path: MomentCurvaturePath) -> Optional[LandmarkPoint]:
     eps_yd = section.steel.fy / section.steel.Es
+    # Only rows with actual reinforcement (area_total_mm2 > 0) can "yield" - a face
+    # configured with n_bars=0/diameter=0 (per a user request) has no bar there, only
+    # the phantom strain a bar *would* have at that depth. No reinforcement anywhere
+    # means there's nothing to find a yield point for.
+    reinforced_rows = [r for r in (section.bottom_row, section.top_row) if r.area_total_mm2 > 0.0]
+    if not reinforced_rows:
+        return None
+
+    def governing_strain(eps0: float, kappa: float) -> float:
+        return max(abs(strain_at(r.z, eps0, kappa)) for r in reinforced_rows)
+
     prev_points = path.points
     prev = None
     for p in prev_points:
-        governing = max(
-            abs(strain_at(section.bottom_row.z, p.eps0, p.kappa)),
-            abs(strain_at(section.top_row.z, p.eps0, p.kappa)),
-        )
+        governing = governing_strain(p.eps0, p.kappa)
         if governing >= eps_yd:
             if prev is None:
                 return LandmarkPoint(kappa=p.kappa, n_x=p.forces[0], m_y=p.forces[1])
-            prev_governing = max(
-                abs(strain_at(section.bottom_row.z, prev.eps0, prev.kappa)),
-                abs(strain_at(section.top_row.z, prev.eps0, prev.kappa)),
-            )
+            prev_governing = governing_strain(prev.eps0, prev.kappa)
             span = governing - prev_governing
             t = 0.0 if span <= 0 else (eps_yd - prev_governing) / span
             t = min(max(t, 0.0), 1.0)

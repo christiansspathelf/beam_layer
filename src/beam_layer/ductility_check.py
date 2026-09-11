@@ -87,8 +87,17 @@ def compression_zone_check(
 
     if kappa > 0:
         d_s, tension_face = params.effective_depth_bottom, "unten (inf)"
+        tension_reinforcement = params.bottom
     else:
         d_s, tension_face = params.effective_depth_top, "oben (sup)"
+        tension_reinforcement = params.top
+
+    if tension_reinforcement.area_total_mm2 <= 0.0:
+        # No "Biegezugbewehrung" on the tension face (n_bars=0/diameter=0, per a user
+        # request) - the whole point of this check is whether the reinforcement yields
+        # before the concrete crushes, which isn't a meaningful question with no
+        # reinforcement there to yield.
+        return None
 
     ratio = x_c / d_s
     limit = _LIMIT_COEFFICIENT * _F_YD_REFERENCE_MPA / steel.fy

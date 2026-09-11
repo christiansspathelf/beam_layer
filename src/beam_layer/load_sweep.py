@@ -112,6 +112,10 @@ def _hard_criteria_tripped(section: LayeredBeamSection, result) -> bool:
     if concrete_crushed:
         return True
     for row in (section.bottom_row, section.top_row):
+        if row.area_total_mm2 <= 0.0:
+            # No reinforcement on this face (n_bars=0/diameter=0) - nothing there to
+            # rupture, matches diagnosis.diagnose_failure's own guard.
+            continue
         if abs(strain_at(row.z, result.eps0, result.kappa)) >= section.steel.eps_su:
             return True
     return False

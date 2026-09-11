@@ -72,3 +72,17 @@ def test_row_response_rupture_returns_zero(params, concrete, steel):
     bottom, _ = build_rebar_rows(params)
     resp = row_response(bottom, steel.eps_su * 1.5, concrete, steel, tension_stiffening=False)
     assert resp.sigma == 0.0
+
+
+def test_build_rebar_rows_handles_zero_reinforcement_without_dividing_by_zero():
+    # Per a user request: n_bars=0 (or diameter=0) must not raise/produce NaN via the
+    # crack-spacing formula's rho denominator - the row simply has zero area.
+    params = BeamParameters(
+        height=0.4, width=0.3, cover=0.03, stirrup_diameter=8.0,
+        bottom=RebarFace(0, 16.0), top=RebarFace(3, 0.0),
+    )
+    bottom, top = build_rebar_rows(params)
+    assert bottom.area_total_mm2 == 0.0
+    assert bottom.s_rm0 == 0.0
+    assert top.area_total_mm2 == 0.0
+    assert top.s_rm0 == 0.0
