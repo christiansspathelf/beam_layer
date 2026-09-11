@@ -1,0 +1,78 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local settings
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+secrets.*
+
+# Licensed reference documents (e.g. SIA norm PDFs) - copyrighted,
+# licensed to an individual/institution, not for redistribution via git
+/grundlagen/
+
+# Spathelf (2018) - a copyrighted published paper used as a legacy
+# validation reference (legacy_shell_layer/experiments/spathelf2018_validation/),
+# not licensed for redistribution; also 55MB, far larger than anything else
+# in this repo
+legacy_shell_layer/examples/Spathelf2018.pdf
+
+# Local dev-server run logs (contain local machine/network details -
+# hostnames, local network IPs - not meant for a public repo)
+*.log
+
+# Data files (results, inputs, exports)
+*.csv
+*.xlsx
+*.xls
+*.h5
+*.hdf5
+*.npy
+*.npz
+/data/
+/results/
+/output/
