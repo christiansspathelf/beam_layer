@@ -36,9 +36,13 @@ htmlcov/
 .idea/
 *.swp
 
-# Claude Code local settings
-.claude/settings.local.json
-.claude/scheduled_tasks.lock
+# Claude Code local settings/tooling - not needed to run or understand the
+# app, and CLAUDE.md documents internal AI-assisted-dev history/rationale
+# not meant for the public student-facing repo. Kept on disk locally (not
+# deleted) so future Claude Code sessions in this working copy still have
+# them - just excluded from what gets pushed.
+/.claude/
+/CLAUDE.md
 
 # OS files
 .DS_Store
@@ -55,11 +59,11 @@ secrets.*
 # licensed to an individual/institution, not for redistribution via git
 /grundlagen/
 
-# Spathelf (2018) - a copyrighted published paper used as a legacy
-# validation reference (legacy_shell_layer/experiments/spathelf2018_validation/),
-# not licensed for redistribution; also 55MB, far larger than anything else
-# in this repo
-legacy_shell_layer/examples/Spathelf2018.pdf
+# Pre-adaptation shell_layer reference material (examples, validation
+# experiments, GUI prototype, shell-only tests) - not part of the active
+# beam_layer package and not needed by students; kept on disk locally as
+# reference (see CLAUDE.md) but excluded from the public repo.
+/legacy_shell_layer/
 
 # Local dev-server run logs (contain local machine/network details -
 # hostnames, local network IPs - not meant for a public repo)
