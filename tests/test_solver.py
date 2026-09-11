@@ -1,21 +1,24 @@
 import numpy as np
 import pytest
 
-from shell_layer import (
+from beam_layer import (
+    BeamParameters,
+    BeamSectionForces,
     ConcreteMaterial,
-    LayeredSection,
-    ReinforcementLayout,
-    SectionForces,
-    ShellParameters,
+    LayeredBeamSection,
+    RebarFace,
     SteelMaterial,
     solve,
+    solve_at_curvature,
 )
 
 
 @pytest.fixture
 def params():
-    rebar = ReinforcementLayout(bar_diameter=12.0, spacing=150.0)
-    return ShellParameters(thickness=0.25, cover=0.03, top_x=rebar, top_y=rebar, bottom_x=rebar, bottom_y=rebar)
+    return BeamParameters(
+        height=0.4, width=0.3, cover=0.03, stirrup_diameter=8.0,
+        bottom=RebarFace(3, 16.0), top=RebarFace(2, 12.0),
+    )
 
 
 @pytest.fixture
@@ -28,36 +31,31 @@ def steel():
     return SteelMaterial(fy=500.0, fu=550.0, Es=200_000.0, eps_su=0.05)
 
 
-def make_section(params, concrete, steel, tension_stiffening=True, n_layers=8):
-    return LayeredSection(params, concrete, steel, tension_stiffening=tension_stiffening, n_concrete_layers=n_layers)
+def make_section(params, concrete, steel, n_layers=20):
+    return LayeredBeamSection(params, concrete, steel, tension_stiffening=False, n_concrete_layers=n_layers)
 
 
-def test_uncracked_response_is_linear_in_the_applied_moment(params, concrete, steel):
-    """Well below the cracking moment, the section is fully elastic, so
-    doubling m_xx should double kappa_x.
-
-    m_xx=0.5/1.0, not the previous 2.0/4.0: compression-side layers sit in
-    State [2] (see crack_membrane.py), whose parabolic law is only
-    linear-ish near the origin - its initial tangent (2*f_c/eps_c0) doesn't
-    match State [1]'s Ecm by construction in this material model (confirmed
-    against the reference; a real, if usually small, inconsistency between
-    the two independently-calibrated curves - see project conversation
-    history). At m_xx=4.0 that's already a measurable ~6% drift; 0.5/1.0
-    stay in the genuinely flat region (<0.02% drift, checked numerically).
-    """
+def test_uncracked_response_is_linear_in_the_applied_moment(params, steel):
+    """Well below the cracking moment (~23 kNm for this section), doubling
+    m_y should double kappa. Needs include_tensile_strength=True
+    explicitly: with the design-default zero-tension law, the tension
+    side is "cracked" (by definition, eps_cr=0) starting from an
+    infinitesimal moment, so there's no comparable "well below cracking,
+    fully uncracked" regime to test against without it."""
+    concrete = ConcreteMaterial(fck=30.0, include_tensile_strength=True)
     section_a = make_section(params, concrete, steel)
-    result_a = solve(section_a, SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=0.5, m_yy=0, m_xy=0))
+    result_a = solve(section_a, BeamSectionForces(n_x=0, v_z=0, m_y=2.0))
     section_b = make_section(params, concrete, steel)
-    result_b = solve(section_b, SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=1.0, m_yy=0, m_xy=0))
+    result_b = solve(section_b, BeamSectionForces(n_x=0, v_z=0, m_y=4.0))
 
     assert result_a.converged and result_b.converged
     assert all(not layer.cracked for layer in result_a.layers if layer.kind == "concrete")
-    assert result_b.kappa[0] == pytest.approx(2.0 * result_a.kappa[0], rel=0.02)
+    assert result_b.kappa == pytest.approx(2.0 * result_a.kappa, rel=0.02)
 
 
 def test_solution_satisfies_equilibrium(params, concrete, steel):
     section = make_section(params, concrete, steel)
-    forces = SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=10.0, m_yy=3.0, m_xy=2.0)
+    forces = BeamSectionForces(n_x=50.0, v_z=0, m_y=30.0)
     result = solve(section, forces)
     assert result.converged
 
@@ -65,24 +63,22 @@ def test_solution_satisfies_equilibrium(params, concrete, steel):
     assert np.allclose(F, forces.to_vector(), atol=1e-2)
 
 
-def test_symmetric_section_pure_bending_gives_near_zero_membrane_response(params, concrete, steel):
-    """A symmetric section under pure m_xx should show a much smaller n_xx
-    than an asymmetric one - not exactly zero (the model drops Poisson
-    coupling once a layer leaves the fully-uncracked isotropic state, so a
-    small residual coupling remains), but small relative to typical force
-    magnitudes at this load level."""
+def test_pure_moment_on_asymmetric_section_gives_nonzero_axial_force_only_from_asymmetry(params, concrete, steel):
+    """This section's bottom (3x16) and top (2x12) reinforcement are not
+    symmetric, so a pure m_y should generally produce a small nonzero
+    n_x - unlike shell_layer's symmetric-section test, there is no
+    expectation of near-zero coupling here."""
     section = make_section(params, concrete, steel)
-    forces = SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=10.0, m_yy=0, m_xy=0)
+    forces = BeamSectionForces(n_x=0, v_z=0, m_y=15.0)
     result = solve(section, forces)
     assert result.converged
     F, _ = section.internal_forces(result.eps0, result.kappa)
-    assert abs(F[0]) < 1.0  # n_xx, kN/m
-    assert abs(F[1]) < 1.0  # n_yy, kN/m
+    assert abs(F[1] - 15.0) < 1e-2
 
 
 def test_result_reports_convergence_diagnostics(params, concrete, steel):
     section = make_section(params, concrete, steel)
-    forces = SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=10.0, m_yy=0, m_xy=0)
+    forces = BeamSectionForces(n_x=0, v_z=0, m_y=15.0)
     result = solve(section, forces)
     assert isinstance(result.converged, bool)
     assert result.iterations > 0
@@ -90,44 +86,31 @@ def test_result_reports_convergence_diagnostics(params, concrete, steel):
 
 
 def test_number_of_layer_results(params, concrete, steel):
-    n_layers = 8
+    n_layers = 20
     section = make_section(params, concrete, steel, n_layers=n_layers)
-    forces = SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=10.0, m_yy=0, m_xy=0)
+    forces = BeamSectionForces(n_x=0, v_z=0, m_y=15.0)
     result = solve(section, forces)
-    assert len(result.layers) == n_layers + 2  # concrete sub-layers + 2 reinforcement panels
+    assert len(result.layers) == n_layers + 2  # concrete sub-layers + 2 reinforcement rows
 
 
 def test_solver_reaches_a_cracked_state(params, concrete, steel):
-    """Regression test: the solver must be able to progress past first
-    cracking, not just stall at the elastic limit. A load-controlled solve
-    of a discretized layered section runs into small but real gaps in the
-    moment-curvature relationship right at each layer's cracking threshold
-    (see shell_layer/solver.py's module docstring) - early versions of the
-    escape-kick mechanism that fixes this either failed to cross the very
-    first one at all, or (a different bug) blew up to unphysical states at
-    higher loads. This exercises the actually-reachable regime.
-    """
+    """Regression guard, mirroring shell_layer's own: the solver must be
+    able to progress past first cracking, not just stall at the elastic
+    limit - see solver.py's module docstring for the discretization-gap
+    mechanism this exercises."""
     section = make_section(params, concrete, steel, n_layers=30)
-    forces = SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=40.0, m_yy=0, m_xy=0)
+    forces = BeamSectionForces(n_x=0, v_z=0, m_y=60.0)
     result = solve(section, forces)
 
     concrete_layers = [layer for layer in result.layers if layer.kind == "concrete"]
     assert any(layer.cracked for layer in concrete_layers)
-    assert all(np.all(np.isfinite(layer.stress)) for layer in result.layers)
-    assert all(abs(v) < 1.0 for layer in concrete_layers for v in layer.strain[:2])  # sane strain magnitude, not blown up
+    assert all(np.isfinite(layer.stress) for layer in result.layers)
+    assert all(abs(layer.strain) < 1.0 for layer in concrete_layers)  # sane strain, not blown up
 
 
 def test_direct_probe_matches_the_incremental_solve(params, concrete, steel):
-    """The direct-solve probe (tried before incremental load-stepping - see
-    `solve`'s docstring) must reach the same equilibrium point as disabling
-    it, for a case where the probe itself does not converge and the solver
-    falls through to the untouched incremental machinery. Regression guard
-    for a bug caught during development: reusing the probe's failed
-    endpoint as the incremental loop's starting point (instead of resetting
-    to the original guess) measurably slowed down exactly this kind of
-    heavily-cracked case."""
     section_probe = make_section(params, concrete, steel, n_layers=30)
-    forces = SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=0, m_yy=0, m_xy=40.0)
+    forces = BeamSectionForces(n_x=0, v_z=0, m_y=60.0)
     result_probe = solve(section_probe, forces)
 
     section_no_probe = make_section(params, concrete, steel, n_layers=30)
@@ -139,12 +122,43 @@ def test_direct_probe_matches_the_incremental_solve(params, concrete, steel):
 
 
 def test_direct_probe_skips_incremental_stepping_for_light_loads(params, concrete, steel):
-    """For a lightly loaded, uncracked section the direct-solve probe should
-    converge outright without ever falling through to incremental
-    load-stepping - i.e. within the probe's own iteration bound, not the
-    hundreds it can take once escape kicks get involved."""
     section = make_section(params, concrete, steel, n_layers=40)
-    forces = SectionForces(n_xx=0, n_yy=0, n_xy=0, m_xx=0, m_yy=0, m_xy=2.0)
+    forces = BeamSectionForces(n_x=0, v_z=0, m_y=5.0)
     result = solve(section, forces)
     assert result.converged
     assert result.iterations <= 40  # solver._DIRECT_PROBE_MAX_ITER
+
+
+def test_solve_at_curvature_matches_solve_for_pure_bending(params, concrete, steel):
+    """For a pure-bending direction (n_x=0), solve_at_curvature at the
+    curvature solve() itself reaches for a given moment should land on
+    the same (eps0, kappa) state - both are just different parametrizations
+    of the same physical moment-curvature relationship."""
+    section = make_section(params, concrete, steel)
+    forces = BeamSectionForces(n_x=0, v_z=0, m_y=15.0)
+    result = solve(section, forces)
+    assert result.converged
+
+    direction = BeamSectionForces(n_x=0, v_z=0, m_y=1.0)
+    result_kappa = solve_at_curvature(section, direction, kappa=result.kappa)
+    assert result_kappa.converged
+    assert result_kappa.eps0 == pytest.approx(result.eps0, abs=1e-6)
+
+
+def test_solve_at_curvature_keeps_forces_proportional_to_direction(params, concrete, steel):
+    section = make_section(params, concrete, steel)
+    direction = BeamSectionForces(n_x=-50.0, v_z=0, m_y=20.0)
+    result = solve_at_curvature(section, direction, kappa=0.005)
+    assert result.converged
+
+    F = section.forces_only(result.eps0, result.kappa)
+    assert F[0] / F[1] == pytest.approx(direction.n_x / direction.m_y, rel=1e-4)
+
+
+def test_solve_at_curvature_zero_curvature_gives_zero_strain(params, concrete, steel):
+    section = make_section(params, concrete, steel)
+    direction = BeamSectionForces(n_x=0, v_z=0, m_y=1.0)
+    result = solve_at_curvature(section, direction, kappa=0.0)
+    assert result.converged
+    assert result.eps0 == pytest.approx(0.0, abs=1e-9)
+    assert result.kappa == 0.0

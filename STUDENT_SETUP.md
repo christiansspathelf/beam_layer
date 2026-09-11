@@ -1,6 +1,6 @@
 # Erste Schritte (für Studierende)
 
-Diese Anleitung erklärt Schritt für Schritt, wie du `shell_layer` auf
+Diese Anleitung erklärt Schritt für Schritt, wie du `beam_layer` auf
 deinem eigenen Computer zum Laufen bringst — geschrieben für den Fall,
 dass du wenig bis keine Vorerfahrung mit Python hast. Falls du dich mit
 Python und virtuellen Umgebungen bereits auskennst, findest du die
@@ -33,9 +33,8 @@ neuer installiert ist.
 
 ## 2. Den Code besorgen
 
-Falls du einen GitHub-Link erhalten hast (z. B.
-`https://github.com/christiansspathelf/shell_layer`), gibt es zwei
-Möglichkeiten — wähle, was dir leichter fällt:
+Falls du einen GitHub-Link erhalten hast, gibt es zwei Möglichkeiten —
+wähle, was dir leichter fällt:
 
 - **Am einfachsten**: Auf der GitHub-Seite auf den grünen Button
   **Code** → **Download ZIP** klicken und die Datei irgendwo entpacken,
@@ -43,7 +42,7 @@ Möglichkeiten — wähle, was dir leichter fällt:
 - **Falls Git installiert ist**: Öffne ein Terminal in dem Ordner, in dem
   das Projekt liegen soll, und führe aus:
   ```
-  git clone https://github.com/christiansspathelf/shell_layer.git
+  git clone <dein-repo-link>
   ```
   Das ist praktischer, falls dein Betreuer später Änderungen pusht — mit
   `git pull` im Projektordner holst du sie dann einfach nach, während ein
@@ -51,7 +50,7 @@ Möglichkeiten — wähle, was dir leichter fällt:
 
 ## 3. Ein Terminal im Projektordner öffnen
 
-- Navigiere im Windows-Explorer in den Ordner `shell_layer` (den, der
+- Navigiere im Windows-Explorer in den Ordner `beam_layer` (den, der
   `pyproject.toml`, `src/`, `gui/` usw. enthält).
 - Klicke in die Adresszeile, tippe `powershell` und drücke Enter. Damit
   öffnet sich ein PowerShell-Terminal direkt in diesem Ordner.
@@ -81,7 +80,7 @@ einfach denselben Befehl dort erneut aus.
 
 Dieser Befehl liest `pyproject.toml` und installiert alles, was das
 Projekt benötigt (NumPy, pytest, Streamlit, Plotly, Matplotlib) in
-`.venv`, zusammen mit dem `shell_layer`-Paket selbst im "editable"-Modus
+`.venv`, zusammen mit dem `beam_layer`-Paket selbst im "editable"-Modus
 — das heisst, wenn du oder dein Betreuer später den Quellcode ändern,
 muss danach nichts neu installiert werden, damit die Änderungen wirksam
 werden. Dieser Schritt braucht eine Internetverbindung und kann beim
@@ -113,15 +112,6 @@ fertig bist.
 Das führt die automatisierten Tests des Projekts aus. Wenn alles ohne
 rote `FAILED`-Zeilen durchläuft, ist das ein gutes Zeichen, dass Schritt
 4–5 korrekt geklappt haben.
-
-## 8. (Optional) Ein einfaches Beispielskript ausführen
-
-```
-.venv\Scripts\python examples\basic_analysis.py
-```
-
-Nützlich, wenn du direkt im Code mit dem Solver herumprobieren willst,
-statt über die GUI.
 
 ## Falls etwas nicht funktioniert
 

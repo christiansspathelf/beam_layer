@@ -2,35 +2,63 @@ import math
 
 import pytest
 
-from shell_layer import ReinforcementLayout, ShellParameters
+from beam_layer import BeamParameters, RebarFace, bar_y_positions_mm
 
 
-def test_bar_area_mm2():
-    layout = ReinforcementLayout(bar_diameter=10.0, spacing=150.0)
-    assert layout.bar_area_mm2 == pytest.approx(math.pi * 100 / 4)
+def test_bar_area_and_total_area():
+    face = RebarFace(n_bars=3, diameter=16.0)
+    assert face.bar_area_mm2 == pytest.approx(math.pi * 16.0**2 / 4.0)
+    assert face.area_total_mm2 == pytest.approx(3 * math.pi * 16.0**2 / 4.0)
 
 
-def test_area_per_width():
-    layout = ReinforcementLayout(bar_diameter=10.0, spacing=150.0)
-    expected = (math.pi * 10.0**2 / 4.0) * 1e-6 * (1000.0 / 150.0)
-    assert layout.area_per_width == pytest.approx(expected)
-
-
-def test_rejects_nonpositive_diameter_or_spacing():
+def test_rebar_face_rejects_nonpositive_values():
     with pytest.raises(ValueError):
-        ReinforcementLayout(bar_diameter=0.0, spacing=150.0)
+        RebarFace(n_bars=0, diameter=16.0)
     with pytest.raises(ValueError):
-        ReinforcementLayout(bar_diameter=10.0, spacing=0.0)
+        RebarFace(n_bars=3, diameter=0.0)
 
 
-def test_shell_parameters_rejects_bad_thickness():
-    rebar = ReinforcementLayout(bar_diameter=10.0, spacing=150.0)
+def test_beam_parameters_rejects_bad_geometry():
+    bottom = RebarFace(3, 16.0)
+    top = RebarFace(2, 12.0)
     with pytest.raises(ValueError):
-        ShellParameters(
-            thickness=0.0,
-            cover=0.03,
-            top_x=rebar,
-            top_y=rebar,
-            bottom_x=rebar,
-            bottom_y=rebar,
-        )
+        BeamParameters(height=0.0, width=0.3, cover=0.03, stirrup_diameter=8.0, bottom=bottom, top=top)
+    with pytest.raises(ValueError):
+        BeamParameters(height=0.4, width=0.0, cover=0.03, stirrup_diameter=8.0, bottom=bottom, top=top)
+
+
+def test_reinforcement_depths_positive_downward():
+    bottom = RebarFace(3, 16.0)
+    top = RebarFace(2, 12.0)
+    params = BeamParameters(height=0.4, width=0.3, cover=0.03, stirrup_diameter=8.0, bottom=bottom, top=top)
+
+    assert params.z_bottom > 0
+    assert params.z_top < 0
+    expected_bottom = 0.4 / 2 - (0.03 + 0.008 + 0.016 / 2)
+    assert params.z_bottom == pytest.approx(expected_bottom)
+    expected_top = -(0.4 / 2 - (0.03 + 0.008 + 0.012 / 2))
+    assert params.z_top == pytest.approx(expected_top)
+
+
+def test_effective_depths():
+    bottom = RebarFace(3, 16.0)
+    top = RebarFace(2, 12.0)
+    params = BeamParameters(height=0.4, width=0.3, cover=0.03, stirrup_diameter=8.0, bottom=bottom, top=top)
+    assert params.effective_depth_bottom == pytest.approx(0.4 / 2 + params.z_bottom)
+    assert params.effective_depth_top == pytest.approx(0.4 / 2 - params.z_top)
+
+
+def test_bar_y_positions_centred_and_symmetric():
+    face = RebarFace(n_bars=3, diameter=16.0)
+    params = BeamParameters(height=0.4, width=0.3, cover=0.03, stirrup_diameter=8.0, bottom=face, top=face)
+    positions = bar_y_positions_mm(face, params)
+    assert len(positions) == 3
+    assert positions[1] == pytest.approx(0.0, abs=1e-9)
+    assert positions[0] == pytest.approx(-positions[2])
+
+
+def test_bar_y_positions_single_bar_is_centred():
+    face = RebarFace(n_bars=1, diameter=16.0)
+    params = BeamParameters(height=0.4, width=0.3, cover=0.03, stirrup_diameter=8.0, bottom=face, top=face)
+    positions = bar_y_positions_mm(face, params)
+    assert positions == pytest.approx([0.0])

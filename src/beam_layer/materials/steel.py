@@ -16,10 +16,17 @@ _D_EPS = 0.005 / 1000.0
 
 @dataclass(frozen=True)
 class SteelMaterial:
-    """Bilinear elastic-hardening reinforcing steel.
+    """Bilinear elastic-hardening reinforcing steel: elastic up to the
+    yield strength (Fliessgrenze) `fy`, then linear from `(fy, eps_y)` to
+    `(fu, eps_su)`. Strain hardening is optional, controlled entirely by
+    `fu` relative to `fy`: `fu == fy` gives `Esh == 0` (elastic-perfectly-
+    plastic, no hardening); `fu > fy` (a higher tensile/ultimate strength,
+    Zugfestigkeit `f_t`, than the yield strength) gives a positive
+    hardening slope. `fu < fy` is not a physically meaningful bilinear
+    law and is rejected.
 
-    fy: yield strength [MPa]
-    fu: ultimate (tensile) strength [MPa]
+    fy: yield strength (Fliessgrenze) [MPa]
+    fu: tensile/ultimate strength (Zugfestigkeit f_t) [MPa], fu >= fy
     Es: elastic modulus [MPa]
     eps_su: strain at fu [-]
     """
@@ -30,6 +37,9 @@ class SteelMaterial:
     eps_su: float
 
     def __post_init__(self) -> None:
+        if self.fu < self.fy:
+            raise ValueError("fu (Zugfestigkeit f_t) must be >= fy (Fliessgrenze) - a bilinear law "
+                              "with a tensile strength below the yield strength is not meaningful")
         if self.eps_su <= self.fy / self.Es:
             raise ValueError("eps_su must be greater than the yield strain fy/Es")
 

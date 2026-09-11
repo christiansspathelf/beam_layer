@@ -1,71 +1,176 @@
-# shell_layer
+# beam_layer
 
-A layered shell element for the structural analysis of reinforced concrete shells, in the sense of structural engineering finite-element theory.
+A layered cross-section element for the structural analysis of a rectangular
+reinforced-concrete **beam**, in the sense of structural engineering
+finite-element theory. Adapted from `shell_layer` (a layered *shell*
+element) - see `CLAUDE.md` for the full story of what changed and why.
 
 ## Purpose
 
-`shell_layer` computes the stress and strain state of a reinforced concrete shell element subjected to the six sectional loading components:
+`beam_layer` computes the stress and strain state of a rectangular RC beam
+cross-section (width `b`, height `h`, in mm) subjected to:
 
-- `n_xx`, `n_yy`, `n_xy` — membrane (in-plane) forces, in **kN/m**
-- `m_xx`, `m_yy`, `m_xy` — bending and twisting moments, in **kNm/m**
+- `N_x` — axial force, in **kN**, tension positive
+- `M_y` — bending moment about the y-axis, in **kNm**
+- `V_z` — transverse shear force, in **kN** - accepted as an input but
+  **not** part of the nonlinear solve (see below); not currently exposed
+  in the GUI (see `CLAUDE.md`'s "Removed from the GUI" section)
 
-The shell element is treated as a stack of discrete layers through its thickness: concrete sub-layers plus two lumped reinforcement panels (bottom and top face, each smearing the x- and y-direction bars). Each layer's strain is derived from the mid-surface strains and curvatures under the Kirchhoff plane-sections assumption, and layer stresses are integrated back through the thickness to find equilibrium with the applied sectional forces and moments.
+The section is treated as a stack of discrete concrete layers through its
+height, plus two lumped reinforcement rows (bottom "inf" and top "sup").
+Each layer's axial strain is derived from the reference-axis strain and
+curvature under the Bernoulli plane-sections assumption
+(`eps(z) = eps0 + z*kappa`), and layer stresses are integrated back
+through the height to find equilibrium with the applied `N_x`/`M_y`. The
+concrete layers span the full gross width at every depth (bar footprints
+included), so each reinforcement row's own force is *net* of the concrete
+stress its footprint would otherwise double-count, not the bare
+`sigma_s * A_s` - see `CLAUDE.md`'s `section.py` entry. The row's reported
+*stress* (`sigma_s`, shown in the GUI) is unaffected by this - only the
+force it contributes to equilibrium is.
 
-**z is positive downward**: the top face is at `z = -h/2`, the bottom face at `z = +h/2`, the mid-surface at `z = 0`.
+**`z` is positive downward, `x` is the beam axis, `y` follows the
+right-hand rule**: the top fibre is at `z = -h/2`, the bottom fibre at
+`z = +h/2`, the reference axis at `z = 0`. Positive `M_y` is sagging
+(tension at the bottom face).
 
-The element has unit in-plane dimensions (1 m × 1 m), so all inputs and outputs are expressed per unit width/length, consistent with `kN/m` and `kNm/m`.
+Only rectangular sections are supported for now - a `Plattenbalken`
+(T-beam, wider flange) is a plausible future extension.
 
-## Material model: Kaufmann's Cracked Membrane Model
+## Material model
 
-Concrete and reinforcement follow a **nonlinear**, biaxial constitutive model, ported from a validated MATLAB reference implementation of Kaufmann's Cracked Membrane Model (ETH Zürich):
+- **Concrete**: a **uniaxial, design (Bemessung)** law (see `CLAUDE.md`'s
+  scoping decisions). Compression follows SIA 262:2025's idealized design
+  diagram (Figure 12 / equation 27, §4.2.1): an almost-parabolic
+  ascending branch to the peak strain `eps_c1d`, a perfectly-plastic
+  plateau to `eps_c2d`, then a hard cutoff (no post-peak softening
+  branch, by design), scaled by the **design compressive strength
+  `f_cd`** (SIA 262 equation (2): `eta_fc*eta_t*fck/gamma_c`,
+  `gamma_c=1.5`) - `f_cd` is the model's main calculation parameter and
+  can be overridden directly. `eps_c1d`/`eps_c2d` default to SIA 262's
+  Table 8 values (2.0‰/3.5‰, constant across concrete classes). Tension
+  is linear up to `fctm` then a brittle cutoff, but **only if
+  `include_tensile_strength` is set** - off by default, since assuming
+  zero concrete tensile capacity is the standard conservative design
+  assumption for a cracked ULS section. A verification (Überprüfung)
+  mode using characteristic/mean values with no partial factors, the way
+  SIA 269/2 assesses existing structures, is a plausible future addition
+  (a separate window) but not implemented.
+- **Reinforcement**: each row's bars follow a bilinear elastic-hardening
+  law - elastic to the yield strength `fy` (Fliessgrenze), then linear to
+  the tensile strength `fu` (Zugfestigkeit `f_t`) at `eps_su`. `fu >= fy`
+  is enforced; `fu == fy` models no hardening (elastic-perfectly-plastic),
+  `fu > fy` models strain hardening. The Tension Chord Model (bond-slip
+  tension stiffening) is implemented and can be switched on, but is
+  **off by default** in this first beam version - its crack-spacing
+  parameters are an unvalidated placeholder for a beam's own tributary
+  geometry.
 
-- **Concrete**: at each layer, principal strains and a **freely rotating crack angle** (realigned with the principal tensile strain direction at every solver iteration, not locked at first cracking) are computed via Mohr's circle. Concrete follows a 6-state classification (uncracked biaxial tension, uncracked light tension-compression, cracked with a compressive diagonal, cracked with a tensile diagonal, cracked in both directions, biaxial compression), with a biaxially-softened parabolic compression law and a brittle tensile cutoff at `fctm`. These states don't form a smooth surface: alongside cracking, the uncracked-tension/uncracked-tension-compression boundary is itself a real (reference-confirmed) stiffness jump — the parabolic compression law's initial tangent doesn't match the linear-elastic modulus there, since the two are independently calibrated. Not a bug; see `shell_layer/crack_membrane.py`'s module docstring.
-- **Reinforcement**: each panel's bars follow a bilinear elastic-hardening law. Once a panel's own strain state has cracked, its stress-strain response switches to Kaufmann/Marti's **Tension Chord Model** (bond-slip based, using stabilized crack spacing and constant bond stress before/after yielding), which is what carries the tension-stiffening effect. This is a single flag: `tension_stiffening=True/False`.
+**Solver note**: the moment-curvature relationship has small but real
+discontinuities right where concrete layers cross their cracking
+threshold - real physical behavior, not a bug. Two solvers are available:
 
-Because cracks rotate freely, shear stress in the principal frame is zero by construction — no separate crack-shear/aggregate-interlock law is needed, unlike a fixed-crack formulation.
-
-**Solver note**: the moment-curvature/force relationship has small but real discontinuities right where individual concrete layers or reinforcement panels cross their cracking threshold (real physical behavior — a discretized layer loses capacity in one finite step, not a bug). Two solvers are available:
-
-- `solve()` — targets a single load vector. Tries a cheap, bounded direct Newton solve at the full target first (skips everything below when it succeeds, e.g. uncracked/lightly cracked sections); otherwise falls back to adaptive incremental load-stepping, damped Newton with backtracking, and an escape-kick fallback for the jumps above (see `shell_layer/solver.py`'s module docstring). Its tangent stiffness is computed via the **complex-step derivative approximation** (`shell_layer/complex_step.py`) — an exact one-sided derivative of whichever constitutive branch the current state is on, avoiding the step-size compromise (and the risk of a finite-difference perturbation straddling a real jump) that a conventional finite-difference tangent has. `AnalysisResult.converged` should always be checked rather than assumed; heavily cracked/high-load targets can land with a non-trivial residual, and on a fine mesh (many tens of concrete layers) can take real time to resolve — the `total_iteration_budget` safety net stops it eventually rather than hanging.
-- `trace_path()` — traces the **full** moment-curvature path via arc-length (Crisfield cylindrical) continuation for a chosen loading direction, scaling it by a load factor `lambda` from zero. Still uses the older finite-difference tangent, not complex-step. See `shell_layer/arclength.py`'s module docstring for the algorithm and its performance characteristics — crossing each cracking transition costs a real sub-solve (~1-3 s), so a curve traced deep into cracking can take real time.
-- `sweep_load_factor()` — a simpler, **load-controlled** alternative for the same purpose: scales a loading direction by an increasing load factor across a chosen number of points, calling `solve()` at each one (warm-started from the previous point) instead of treating the load factor as an unknown. Cannot follow the response *past* a genuine capacity limit the way arc-length can, but this model has no post-peak softening branch (see below), so there's nothing physically meaningful past a limit to follow anyway. Stops automatically once `diagnose_failure()` confirms it has reached one. This is what the GUI's "Complete load-deformation curve" tab uses.
-- `diagnose_failure()` — for a `solve()` result with `converged=False`, distinguishes a genuine physical capacity limit (concrete crushing, reinforcement rupture, a tangent stiffness trending singular) from a numerical/discretization difficulty, rather than leaving `converged=False` ambiguous. See `shell_layer/diagnosis.py`'s module docstring.
-- `find_ultimate_load()` — finds the **ultimate load factor** for a loading direction (the largest scaling the section can carry) via bracket-then-bisect: one cheap coarse `sweep_load_factor()` pass to bracket a genuine capacity limit, then bisection to refine it to a chosen tolerance (default 1%) - typically ~15-20 `solve()` calls total, regardless of how far out the true capacity is. Reports the governing failure mechanism alongside it via `diagnose_failure()`. This is what the GUI's "Traglastberechnung" tab uses.
+- `solve()` — targets a single load vector `(N_x, M_y)`. Adaptive
+  incremental load-stepping, damped Newton with backtracking, and an
+  escape-kick fallback for the cracking jump; tangent stiffness via the
+  complex-step derivative (`complex_step.py`). Always check
+  `AnalysisResult.converged`.
+- `sweep_load_factor()` — load-controlled path tracing: scales a loading
+  direction by an increasing load factor and calls `solve()` at each
+  point, stopping once `diagnose_failure()` confirms a genuine capacity
+  limit. Used internally by `find_ultimate_load()`.
+- `sweep_curvature()` — curvature-controlled, **open-ended** path
+  tracing: steps curvature itself and calls `solve_at_curvature()` at
+  each one to find the axial strain that keeps the section on the
+  loading direction's ratio. This is what the GUI's "Complete load-
+  deformation curve" tab uses - equal load steps sample the region near
+  the section's true capacity very coarsely once the response starts to
+  flatten, while equal curvature steps sample it evenly, making the
+  failure point easier to locate on the curve. There's no `max_curvature`
+  to set - the sweep runs until it finds the section's own capacity
+  limit (or an internal safety cap, for a pathological input). The first
+  `ramp_substeps` points ramp finely up to one full `step` before the
+  sweep settles into stepping by a full `step` each time, so a short
+  uncracked/linear region near zero curvature isn't skipped by one big
+  first jump. Stops at the first point (converged or not) that trips the
+  model's hard failure criteria - concrete crushes layer-by-layer, so a
+  purely load-based "did it fail to converge" check can miss a capacity
+  limit the solver still manages to satisfy numerically at a lower
+  moment.
+- `diagnose_failure()` — for a `solve()` result with `converged=False`,
+  distinguishes a genuine physical capacity limit (concrete crushing,
+  reinforcement rupture, a near-singular tangent) from a numerical/
+  discretization difficulty.
+- `find_ultimate_load()` — the ultimate load factor via bracket-then-
+  bisect. This is what the GUI's "Traglastberechnung" tab uses.
+- `shear_resistance_estimate()` — an **informational**, simplified
+  concrete shear resistance (`V_Rd,c`-style), compared against `V_z` but
+  not coupled into the nonlinear solve. Not currently called from the
+  GUI (`V_z` isn't exposed there right now), but a fully working, tested
+  library function.
+- `compression_zone_check()` — an **informational** ductility check, SIA
+  262:2025 §4.1.4.2.5: the compression zone depth ratio `x_c/d_s` against
+  `0.35*435/f_yd`. Shown on the GUI's single-load tab.
+- `LayeredBeamSection.force_resultants()` — the concrete compression
+  resultant (with its own line-of-action depth) plus both steel rows'
+  forces at a given `(eps0, kappa)` - the classic "innere Kräftepaar"
+  picture, computed directly from the layered model. Shown as text and
+  overlaid on the GUI's Aufriss on both the single-load and curve tabs.
+- `find_curve_landmarks()` / `elastic_uncracked_reference()` — locates
+  cracking ("cr"), first reinforcement yield ("y"), and the ultimate
+  point ("u") on a `sweep_curvature` path, plus a linear-elastic,
+  uncracked, transformed-section reference line/cracking moment
+  (independent of whether the nonlinear model's own
+  `include_tensile_strength` is on). Shown on the GUI's curve tab.
 
 ## Configurable parameters
 
-- Shell element thickness `h`, concrete cover `c`
-- Reinforcing bar diameter and spacing (mm), per direction and face
-- Concrete: `fck` (with `Ecm`, `fctm`, `eps_c0` auto-filled, or overridable)
-- Steel: `fy`, `fu`, `Es`, `eps_su`
-- Tension stiffening on/off, number of concrete sub-layers
+- Section height `h`, width `b`, concrete cover `c`, stirrup diameter
+- Bottom/top reinforcement: number of bars and diameter per face
+- Concrete: a class dropdown (C20/25-C50/60, SIA 262:2025 Tabelle 3/8
+  design values) or manual `fck` (with `Ecm`, `fctm` auto-filled, or
+  overridable), `f_cd` (SIA 262 equation (2) auto-fill via `eta_t`, or
+  overridden directly - the main calculation parameter), `eps_c1d`/
+  `eps_c2d` (SIA 262:2025 Table 8 defaults, overridable), tensile
+  strength on/off (off by default)
+- Steel: a class dropdown (B500B/B500C/B700B, SIA 262:2025 Tabelle 9
+  design values) or manual `fy`, `fu` (`f_t`, Zugfestigkeit - `fu >= fy`
+  enforced), `Es`, `eps_su`
+- Number of concrete sub-layers (default 50)
+
+Tension stiffening (`SteelMaterial`'s TCM law) is implemented in the
+library but not currently exposed as a GUI control - see `CLAUDE.md`'s
+"Removed from the GUI" section.
 
 ## Project structure
 
 ```
-src/shell_layer/
+src/beam_layer/
     materials/
-        concrete.py     ConcreteMaterial: fck-based parameters, compression law
-        steel.py        SteelMaterial: bilinear law + Tension Chord Model
-    crack_membrane.py   Rotating-crack concrete constitutive response (6-state)
-    reinforcement.py    Sandwich-model reinforcement panels, crack spacing, TCM dispatch
-    geometry.py          ShellParameters, ReinforcementLayout
-    layers.py            Concrete sub-layer discretization
-    section.py            LayeredSection: forward force evaluation, FD tangent
-    complex_step.py       Exact tangent via complex-step derivative (solve()'s default)
-    loading.py            SectionForces (n_xx, n_yy, n_xy, m_xx, m_yy, m_xy)
-    solver.py             Point-target solve: adaptive load-stepping + damped Newton
-    arclength.py           Full moment-curvature path tracing: arc-length continuation
-    load_sweep.py           Load-controlled path tracing: sweep_load_factor()
-    diagnosis.py             Genuine capacity limit vs. numerical stall: diagnose_failure()
-    ultimate_load.py          Ultimate load factor via bracket-then-bisect: find_ultimate_load()
-    results.py            AnalysisResult / LayerResult containers
+        concrete.py       ConcreteMaterial: fck-based parameters, compression law
+        steel.py           SteelMaterial: bilinear law + Tension Chord Model
+    uniaxial_concrete.py    Uniaxial concrete constitutive response
+    reinforcement.py         Reinforcement rows, TCM dispatch
+    geometry.py                BeamParameters, RebarFace
+    layers.py                   Concrete sub-layer discretization
+    section.py                   LayeredBeamSection: forward force evaluation, FD tangent
+    complex_step.py                Exact tangent via complex-step derivative (solve()'s default)
+    loading.py                      BeamSectionForces (n_x, v_z, m_y)
+    solver.py                        Point-target solve: adaptive load-stepping + damped Newton
+    arclength.py                      PathPoint/MomentCurvaturePath containers
+    load_sweep.py                      Load-controlled path tracing: sweep_load_factor()
+    diagnosis.py                        Genuine capacity limit vs. numerical stall: diagnose_failure()
+    ultimate_load.py                     Ultimate load factor: find_ultimate_load()
+    shear_check.py                        Informational shear resistance estimate (not called from the GUI)
+    ductility_check.py                     Informational compression-zone-depth-ratio check
+    curve_landmarks.py                      Moment-curvature "cr"/"y"/"u" points + elastic reference
+    results.py                                BeamAnalysisResult / BeamLayerResult containers
 gui/
-    app.py                Streamlit GUI: parameter input, 3D preview, through-thickness/
-                          characteristic plots (Plotly), plan-view crack pattern
-    prototype_3d_shell.py Standalone prototype for the 3D view's design (not run by app.py)
+    app.py                Streamlit GUI: parameter input, to-scale cross-section preview,
+                          strain/stress plots (Plotly)
 tests/                    pytest unit + integration tests
-examples/                 Example usage scripts
+legacy_shell_layer/       pre-adaptation shell_layer content (examples, experiments,
+                          shell-only tests, GUI prototype) - reference only, see CLAUDE.md
 ```
 
 ## Getting started
@@ -74,7 +179,6 @@ examples/                 Example usage scripts
 python -m venv .venv
 .venv\Scripts\pip install -e ".[dev,gui]"
 .venv\Scripts\pytest
-.venv\Scripts\python examples\basic_analysis.py
 .venv\Scripts\streamlit run gui\app.py
 ```
 
@@ -83,19 +187,28 @@ for the same steps spelled out in more detail.
 
 ## Status
 
-Core nonlinear layered-section solver, Cracked Membrane Model constitutive
-behavior, arc-length moment-curvature path tracing, and a Streamlit GUI are
-implemented and tested. Known limitation: tracing a curve deep into
-cracking is slow (crossing each layer's cracking threshold costs a real
-sub-solve, see the solver note above) - correct and bounded, but not fast
-enough yet for a "click and wait a second" experience past significant
-cracking.
+First working version: core nonlinear layered-beam solver, an SIA
+262:2025-based concrete compression law and design material classes,
+curvature-controlled curve tracing (with cracking/yield/ultimate
+landmarks and an elastic-uncracked reference line), ultimate-load
+search, a compression-zone ductility check, internal force resultants
+(concrete compression + both steel rows), and a Streamlit GUI (in
+German) with a to-scale cross-section preview, a longitudinal elevation
+("Aufriss") showing the reinforcement layout, the applied N_x/M_y and
+the computed force resultants on the left cut face, a slider to step
+through a computed moment-curvature curve, and live material-law plots.
+Known scoping limitations (see `CLAUDE.md`): `V_z` and tension
+stiffening are implemented in the library but not currently exposed in
+the GUI, and only rectangular sections are supported.
 
 ## Reference
 
-Constitutive formulas and the overall "sandwich model" solution scheme are
-ported from a MATLAB implementation of Kaufmann's Cracked Membrane Model,
-provided as a reference for this port.
+Adapted from `shell_layer`, whose overall sandwich-model solution scheme
+was ported from a MATLAB implementation of Kaufmann's Cracked Membrane
+Model - see `legacy_shell_layer/` and `CLAUDE.md`. The concrete
+compression law is ported from SIA 262:2025 "Betonbau" (§4.2.1, Figure
+12/equation 27/Table 8) - see `CLAUDE.md`'s "Authoritative reference"
+section; the source PDF is kept in `grundlagen/` (gitignored, licensed).
 
 ## License
 

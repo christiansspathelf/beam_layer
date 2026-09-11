@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "shell-layer"
-version = "0.2.0"
-description = "Layered-section analysis of reinforced concrete shell elements"
+name = "beam-layer"
+version = "0.1.0"
+description = "Layered-section analysis of rectangular reinforced concrete beam cross-sections"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

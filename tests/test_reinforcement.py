@@ -1,52 +1,74 @@
-import math
-
 import pytest
 
-from shell_layer import ReinforcementLayout, ShellParameters
-from shell_layer.reinforcement import build_reinforcement_panels, crack_spacing, individual_bar_depths
+from beam_layer import BeamParameters, ConcreteMaterial, RebarFace, SteelMaterial
+from beam_layer.reinforcement import build_rebar_rows, row_response
 
 
 @pytest.fixture
 def params():
-    rebar = ReinforcementLayout(bar_diameter=12.0, spacing=150.0)
-    return ShellParameters(thickness=0.25, cover=0.03, top_x=rebar, top_y=rebar, bottom_x=rebar, bottom_y=rebar)
+    return BeamParameters(
+        height=0.4, width=0.3, cover=0.03, stirrup_diameter=8.0,
+        bottom=RebarFace(3, 16.0), top=RebarFace(2, 12.0),
+    )
 
 
-def test_panel_depths_positive_downward(params):
-    bottom, top = build_reinforcement_panels(params)
-    assert bottom.z > 0
-    assert top.z < 0
-    assert bottom.z == pytest.approx(params.thickness / 2 - params.cover - 0.012)
-    assert top.z == pytest.approx(-(params.thickness / 2 - params.cover - 0.012))
+@pytest.fixture
+def concrete():
+    # include_tensile_strength=True: these tests exercise the reinforcement
+    # row's own local cracking transition around a genuine nonzero cracking
+    # strain, independent of the *main* stress-strain law's design-default
+    # zero-tension assumption (ConcreteMaterial's own default) - see
+    # materials/concrete.py.
+    return ConcreteMaterial(fck=30.0, include_tensile_strength=True)
 
 
-def test_panel_reinforcement_ratio_and_spacing(params):
-    bottom, _ = build_reinforcement_panels(params)
-    thickness = 2.0 * (params.cover + 0.012)
-    expected_rho = params.bottom_x.area_per_width / thickness
-    assert bottom.thickness == pytest.approx(thickness)
-    assert bottom.rho_x == pytest.approx(expected_rho)
-    expected_srm0 = 12.0 * (1 - expected_rho) / (4 * expected_rho)
-    assert bottom.s_rm0_x == pytest.approx(expected_srm0)
+@pytest.fixture
+def steel():
+    return SteelMaterial(fy=500.0, fu=550.0, Es=200_000.0, eps_su=0.05)
 
 
-def test_crack_spacing_special_cases():
-    assert crack_spacing(100.0, 200.0, 0.0) == pytest.approx(100.0)
-    assert crack_spacing(100.0, 200.0, math.pi / 2) == pytest.approx(200.0)
+def test_row_depths_match_params(params):
+    bottom, top = build_rebar_rows(params)
+    assert bottom.z == pytest.approx(params.z_bottom)
+    assert top.z == pytest.approx(params.z_top)
+    assert bottom.diameter == 16.0
+    assert top.diameter == 12.0
 
 
-def test_crack_spacing_combines_at_intermediate_angle():
-    s = crack_spacing(100.0, 200.0, math.pi / 4)
-    expected = 1.0 / (math.cos(math.pi / 4) / 100.0 + math.sin(math.pi / 4) / 200.0)
-    assert s == pytest.approx(expected)
+def test_row_area_matches_face(params):
+    bottom, top = build_rebar_rows(params)
+    assert bottom.area_total_mm2 == pytest.approx(params.bottom.area_total_mm2)
+    assert top.area_total_mm2 == pytest.approx(params.top.area_total_mm2)
 
 
-def test_individual_bar_depths_nested_x_outer_y_inner(params):
-    """x-direction bars are the outer layer on each face, y nested inside -
-    so |z_xB| > |z_yB| (x closer to the bottom face) and |z_xT| > |z_yT|
-    (x closer to the top face)."""
-    depths = individual_bar_depths(params)
-    assert depths.z_xB > depths.z_yB > 0  # bottom: x outermost (largest z), both positive
-    assert depths.z_xT < depths.z_yT < 0  # top: x outermost (most negative z), both negative
-    assert depths.z_xB == pytest.approx(params.thickness / 2 - params.cover - 0.006)
-    assert depths.z_yB == pytest.approx(params.thickness / 2 - params.cover - 0.012 - 0.006)
+def test_row_response_elastic_branch(params, concrete, steel):
+    bottom, _ = build_rebar_rows(params)
+    eps = concrete.eps_cr * 0.5  # below both the concrete cracking strain and steel yield strain
+    resp = row_response(bottom, eps, concrete, steel, tension_stiffening=False)
+    assert resp.sigma == pytest.approx(steel.Es * eps, rel=1e-6)
+    assert not resp.cracked
+
+
+def test_row_response_marks_cracked_past_concrete_cracking_strain(params, concrete, steel):
+    bottom, _ = build_rebar_rows(params)
+    eps = concrete.eps_cr * 2.0
+    resp = row_response(bottom, eps, concrete, steel, tension_stiffening=False)
+    assert resp.cracked
+
+
+def test_row_response_tension_stiffening_off_uses_bare_law(params, concrete, steel):
+    """With tension_stiffening=False (this version's default - see
+    CLAUDE.md), the row's stress must match the ordinary bilinear law even
+    once the local strain has cracked, not the TCM tension-chord offset."""
+    bottom, _ = build_rebar_rows(params)
+    eps = concrete.eps_cr * 3.0
+    resp_off = row_response(bottom, eps, concrete, steel, tension_stiffening=False)
+    resp_on = row_response(bottom, eps, concrete, steel, tension_stiffening=True)
+    assert resp_off.sigma == pytest.approx(steel.Es * eps, rel=1e-6)
+    assert resp_on.sigma > resp_off.sigma  # TCM's bond offset stiffens the response
+
+
+def test_row_response_rupture_returns_zero(params, concrete, steel):
+    bottom, _ = build_rebar_rows(params)
+    resp = row_response(bottom, steel.eps_su * 1.5, concrete, steel, tension_stiffening=False)
+    assert resp.sigma == 0.0

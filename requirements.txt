@@ -1,0 +1,15 @@
+# Runtime dependencies for the Streamlit app (gui/app.py), for deployment
+# targets that expect a requirements.txt (Streamlit Community Cloud, Hugging
+# Face Spaces, etc.) - mirrors pyproject.toml's [project.dependencies] +
+# [project.optional-dependencies].gui exactly. Local development still uses
+# `pip install -e ".[dev,gui]"` (see README.md/CLAUDE.md) - this file is only
+# for a deploy target that installs from requirements.txt instead of the
+# package itself, so it does not include pytest (dev/test-only, not needed
+# to run the app) or an editable install of beam_layer itself (the deploy
+# target runs gui/app.py directly, which adds src/ to sys.path itself - see
+# that file's own sys.path.insert call - so the package doesn't need to be
+# pip-installed at all for this to work).
+numpy>=1.24
+streamlit>=1.30
+matplotlib>=3.7
+plotly>=5.20
