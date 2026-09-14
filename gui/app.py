@@ -34,6 +34,7 @@ from beam_layer import (  # noqa: E402
     LayeredBeamSection,
     RebarFace,
     SteelMaterial,
+    __version__,
     bar_y_positions_mm,
     compression_zone_check,
     diagnose_failure,
@@ -59,6 +60,43 @@ TENSION_STIFFENING = False
 # while this is False. Flip back to True (or expose as a checkbox) to restore
 # both tabs; no other code needs to change.
 SHOW_ALL_TABS = False
+
+CHANGELOG_PATH = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+
+
+def _load_changelog_entry(version: str) -> list[str]:
+    """Bullet lines under CHANGELOG.md's `## [<version>]` heading (any
+    `###` sub-headings inside that section are skipped, only lines
+    starting with "- " are kept), so the sidebar footer can show "what's
+    new" for the version currently running - per a user request, so a
+    Streamlit Community Cloud redeploy after a `git push` is visible in
+    the app itself, not just in Git history (see CHANGELOG.md's own
+    header for the versioning scheme). Returns `[]` (never raises) if the
+    file is missing or has no matching section - a stale/missing
+    changelog must degrade the footer, not break the app."""
+    try:
+        text = CHANGELOG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    marker = f"## [{version}]"
+    start = text.find(marker)
+    if start == -1:
+        return []
+    start = text.find("\n", start) + 1
+    end = text.find("\n## [", start)
+    section = text[start:] if end == -1 else text[start:end]
+    # A bullet's text can wrap onto following indented lines (see CHANGELOG.md's
+    # 0.2.0 entry) - those continuation lines don't start with "- " themselves,
+    # so they're appended onto the last bullet rather than dropped. Blank lines
+    # and "### " sub-headings (e.g. "### Added") are skipped, not appended.
+    bullets: list[str] = []
+    for line in section.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            bullets.append(stripped[2:])
+        elif stripped and bullets and not stripped.startswith("#"):
+            bullets[-1] += " " + stripped
+    return bullets
 
 # "Last-Verformungskurve" tab: sweep_curvature's step size and initial-ramp
 # resolution, per a user request - not exposed as GUI inputs (the sweep is
@@ -1090,6 +1128,14 @@ with st.sidebar:
     d1, d2 = st.columns(2)
     dir_n_x = d1.number_input("$N_x$ [kN]", value=0.0, step=1.0, help="Zug positiv")
     dir_m_y = d2.number_input("$M_y$ [kNm]", value=30.0, step=1.0)
+
+    st.divider()
+    st.caption(f"beam_layer v{__version__}")
+    _changelog_bullets = _load_changelog_entry(__version__)
+    if _changelog_bullets:
+        with st.expander("Was ist neu in dieser Version?"):
+            for _bullet in _changelog_bullets:
+                st.markdown(f"- {_bullet}")
 
 params = BeamParameters(
     height=height_mm / 1000.0, width=width_mm / 1000.0, cover=cover_mm / 1000.0,

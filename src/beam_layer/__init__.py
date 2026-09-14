@@ -25,9 +25,10 @@ from .shear_check import ShearCheckResult, shear_resistance_estimate
 from .solver import solve, solve_at_curvature
 from .ultimate_load import UltimateLoadResult, find_ultimate_load
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
+    "__version__",
     "ConcreteMaterial",
     "SteelMaterial",
     "RebarFace",
