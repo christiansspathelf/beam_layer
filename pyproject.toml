@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beam-layer"
-version = "0.2.0"
+version = "0.2.2"
 description = "Layered-section analysis of rectangular reinforced concrete beam cross-sections"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -25,6 +25,33 @@ it's a developer record, not GUI copy).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-15
+
+### Changed
+
+- Titel des Dehnungs-/Spannungsdiagramms ausgeschrieben ("Längsdehnung
+  ε_x(z)" / "Spannungsverteilung σ_x,i(z)") statt nur "ε(z)"/"σ(z)", mit
+  Einheiten auf den x-Achsen ([‰] bzw. [N/mm²]).
+- "Durchmesser" -> "Stabdurchmesser" bei der Bewehrungseingabe;
+  "Bewehrungsstahl" -> "Betonstahl" durchgängig in der Seitenleiste und im
+  Werkstoffgesetz-Diagramm.
+- Standardwerte angepasst: Bügeldurchmesser 8 -> 10 mm, Bewehrungs-
+  überdeckung 30 -> 35 mm.
+
+## [0.2.1] - 2026-09-14
+
+### Changed
+
+- GUI-Terminologie an HSLU_IBI_stahlbetonQuerschnittsanalyse.pdf angeglichen:
+  "Betondeckung" -> "Bewehrungsüberdeckung" (Symbol weiterhin `c_nom`); die
+  Bewehrungslagen werden in der Seitenleiste jetzt zuerst oben (sup), dann
+  unten (inf) angezeigt, mit ausgeschriebenen Labels; das
+  Schnittkörperdiagramm-Panel heisst neu "... mit Beanspruchung und
+  resultierenden inneren Kräften" statt "... mit Einwirkungen und inneren
+  Kräften" ("Einwirkung" ist im Skript den äusseren Lasten G/Q vorbehalten);
+  das Querschnitts-Panel heisst neu "Querschnitt mit konstruktiver
+  Durchbildung".
+
 ## [0.2.0] - 2026-09-14
 
 ### Added

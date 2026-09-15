@@ -211,7 +211,7 @@ def rebar_face_input(face: str, default_n: int, default_diam: float) -> RebarFac
         key=f"{face}_n", help="0 = keine Bewehrung auf dieser Seite",
     )
     diam = col2.number_input(
-        rf"Durchmesser $\varnothing_{{s,\mathrm{{{face}}}}}$ [mm]", min_value=0.0, max_value=40.0,
+        rf"Stabdurchmesser $\varnothing_{{s,\mathrm{{{face}}}}}$ [mm]", min_value=0.0, max_value=40.0,
         value=default_diam, step=1.0, format="%.0f", key=f"{face}_diam",
         help="0 = keine Bewehrung auf dieser Seite",
     )
@@ -327,13 +327,16 @@ def combined_geometry_figure(params: BeamParameters, n_x: float, m_y: float,
         rows=1, cols=2, shared_yaxes=True, column_widths=[0.22, 0.78], horizontal_spacing=0.1,
         # Per a user request - "Schnittkörperdiagramm" matches the term
         # HSLU_IBI_stahlbetonQuerschnittsanalyse.pdf's Bild 3.4 uses for this same
-        # "forces drawn on a cut face" elevation. "Einwirkungen"/"inneren Kräften":
-        # the user's own draft had "Auswirkungen" (impacts/consequences) and
-        # nominative "innere Kräfte" after "mit" (dative) - corrected to the
-        # engineering term already used elsewhere in this app ("Einwirkung", the
-        # sidebar section) and to the dative plural "mit" requires.
-        subplot_titles=["Querschnitt mit Bewehrungsanordnung",
-                         "Schnittkörperdiagramm mit Einwirkungen und inneren Kräften"],
+        # "forces drawn on a cut face" elevation. The panel title was originally
+        # "... mit Einwirkungen und inneren Kräften", but the script reserves
+        # "Einwirkung" for the external loads (G, Q) themselves - the quantity
+        # actually shown here (N_x/M_y, the SKD's own applied cut) is what the
+        # script calls "Beanspruchung" (see Bild 4.6/4.9's column headers
+        # "Querschnitt und Beanspruchung" / "Resultierende innere Kräfte") -
+        # corrected to match. "Querschnitt mit Bewehrungsanordnung" -> "... mit
+        # konstruktiver Durchbildung" for the same reason, Bild 3.3's own term.
+        subplot_titles=["Querschnitt mit konstruktiver Durchbildung",
+                         "Schnittkörperdiagramm mit Beanspruchung und resultierenden inneren Kräften"],
     )
 
     # ---------------- Left: cross-section (col=1) ----------------
@@ -843,8 +846,45 @@ def strain_stress_figure(section: LayeredBeamSection, eps0: float, kappa: float)
     bar_labels = [label for _, _, label in reinforced_rows]
     bar_symbols = ["circle" if label == "inf" else "square" for label in bar_labels]
 
-    fig = make_subplots(rows=1, cols=2, shared_yaxes=True, horizontal_spacing=0.06,
-                         subplot_titles=["ε(z)", "σ(z)"])
+    fig = make_subplots(
+        rows=1, cols=2, shared_yaxes=True, horizontal_spacing=0.06,
+        # Per a user request - matches the axis-title notation below
+        # ($\epsilon_x$/$\sigma_{x,i}$: x for the beam-axis strain/stress
+        # component, i for "per fibre/layer" on the stress side). Plain HTML
+        # (Plotly's own small supported tag set: <i>/<sub>/etc.), not MathJax
+        # LaTeX - two things were tried and rejected first: (1) a plain-text
+        # word followed by a separate "$...$" math span ("Längsdehnung
+        # $\epsilon_x(z)$") - Plotly only runs MathJax on a string that starts
+        # and ends with "$", so the plain-text part outside the dollar signs
+        # was silently dropped, not shown alongside the math; (2) wrapping the
+        # *entire* title as one "$...$" expression with the German word inside
+        # \text{} - fixed the dropped-text problem, but a user's screenshot
+        # showed "Längsdehnung" specifically (the word with the "ä") rendering
+        # with overlapping/garbled glyphs - a MathJax\text{}-plus-umlaut font
+        # issue in this app's MathJax 2.7.5 build, not seen on the (umlaut-
+        # free) "Spannungsverteilung" title. Plain HTML sidesteps MathJax
+        # entirely for these two titles - same approach already used
+        # elsewhere in this file for a plain axis title with a subscript
+        # (e.g. `concrete_characteristic_figure`'s "ε<sub>c</sub> [‰]") - and
+        # is what's used below. The axis *unit* titles further down keep the
+        # "$...$"-wrapped LaTeX form; they have no German/umlaut text in them
+        # and were confirmed rendering correctly in that same screenshot.
+        subplot_titles=["Längsdehnung <i>ε<sub>x</sub></i>(z)",
+                         "Spannungsverteilung <i>σ<sub>x,i</sub></i>(z)"],
+    )
+    # These two titles are longer than the plain "ε(z)"/"σ(z)" titles this figure
+    # used before switching to them, and (back when they were tried as MathJax -
+    # see the comment above) rendered taller than plain SVG text at the same
+    # nominal size - the original 35px top margin (tuned for the old short plain
+    # titles) left them overlapping the plot's own top frame line (`showline`+
+    # `mirror` draw a full box around each subplot), a user caught this. The
+    # margin below was widened to fix it, and is kept even after the titles moved
+    # off MathJax (now plain HTML) as a safety margin for the still-longer text.
+    # Must run right here, before the per-bar-label annotations added below via
+    # `fig.add_annotation` also land in `fig.layout.annotations` - at this point
+    # the list still holds only these two subplot-title annotations.
+    for ann in fig.layout.annotations:
+        ann.update(font=dict(size=13), yshift=8)
 
     fig.add_trace(go.Scatter(
         # Plain white, no fill - per a user request reverting an earlier attempt to
@@ -889,8 +929,8 @@ def strain_stress_figure(section: LayeredBeamSection, eps0: float, kappa: float)
                             xanchor="left" if sigma_s >= 0 else "right",
                             xshift=6 if sigma_s >= 0 else -6, row=1, col=2)
 
-    fig.update_xaxes(title_text="ε [‰]", row=1, col=1)
-    fig.update_xaxes(title_text="σ [N/mm²]", row=1, col=2)
+    fig.update_xaxes(title_text=r"$\epsilon_x\ \left[\text{‰}\right]$", row=1, col=1)
+    fig.update_xaxes(title_text=r"$\sigma_{x,i}\ \left[\text{N/mm}^2\right]$", row=1, col=2)
     fig.update_yaxes(title_text="z [mm]", row=1, col=1)
     fig.update_yaxes(range=[h_mm / 2, -h_mm / 2])
     for c in (1, 2):
@@ -898,7 +938,7 @@ def strain_stress_figure(section: LayeredBeamSection, eps0: float, kappa: float)
     fig.update_xaxes(showline=True, linecolor="white", linewidth=1, mirror=True)
     fig.update_yaxes(showline=True, linecolor="white", linewidth=1, mirror=True)
     fig.update_layout(
-        height=460, margin=dict(l=55, r=20, t=35, b=45),
+        height=460, margin=dict(l=55, r=20, t=55, b=45),
         legend=dict(font=dict(size=10), orientation="h", yanchor="bottom", y=-0.25, x=0.5, xanchor="center"),
     )
     return fig
@@ -939,7 +979,7 @@ def steel_characteristic_figure(eps_range_permil: np.ndarray, sigma_range: np.nd
     fig.update_yaxes(title="σ<sub>s</sub> [N/mm²]",
                       showline=True, linecolor="white", linewidth=1, mirror=True)
     fig.update_layout(
-        title=dict(text="Bewehrungsstahl (Zugbereich)", font=dict(size=13), x=0.5, xanchor="center"),
+        title=dict(text="Betonstahl (Zugbereich)", font=dict(size=13), x=0.5, xanchor="center"),
         height=380, margin=dict(l=60, r=20, t=40, b=45), legend=dict(font=dict(size=10)),
     )
     return fig
@@ -998,16 +1038,24 @@ with st.sidebar:
                                  format="%.0f")
     width_mm = st.number_input("Breite $b$ [mm]", min_value=100.0, max_value=1500.0, value=300.0, step=10.0,
                                 format="%.0f")
-    cover_mm = st.number_input(r"Betondeckung $c_\mathrm{nom}$ [mm]", min_value=10.0, max_value=80.0, value=30.0,
-                                step=5.0, format="%.0f")
+    # "Bewehrungsüberdeckung", not "Betondeckung" - per a user request, matching
+    # HSLU_IBI_stahlbetonQuerschnittsanalyse.pdf Kap. 3.4's own definition of
+    # c_nom as the "(nominelle) Bewehrungsüberdeckung" (the symbol itself,
+    # c_nom, is unaffected).
+    cover_mm = st.number_input(r"Bewehrungsüberdeckung $c_\mathrm{nom}$ [mm]", min_value=10.0, max_value=80.0,
+                                value=35.0, step=5.0, format="%.0f")
 
     st.header("Bewehrung")
     stirrup_diam_mm = st.number_input(r"Bügeldurchmesser $\varnothing_{sw}$ [mm]", min_value=0.0, max_value=20.0,
-                                       value=8.0, step=1.0, format="%.0f")
-    st.caption("Unten (inf)")
-    bottom_face = rebar_face_input("inf", 3, 16.0)
-    st.caption("Oben (sup)")
+                                       value=10.0, step=1.0, format="%.0f")
+    # Sup before inf - per a user request, matching the order
+    # HSLU_IBI_stahlbetonQuerschnittsanalyse.pdf and its Bild 3.3 consistently
+    # use (upper/sup face named first, then the lower/inf face) - was the
+    # reverse before.
+    st.caption("Obere Bewehrung (sup)")
     top_face = rebar_face_input("sup", 2, 12.0)
+    st.caption("Untere Bewehrung (inf)")
+    bottom_face = rebar_face_input("inf", 3, 16.0)
 
     st.header("Beton")
     beton_optionen = ["Manuell"] + list(BETON_KLASSEN.keys())
@@ -1086,7 +1134,7 @@ with st.sidebar:
         eps_c1d=eps_c1d / 1000.0, eps_c2d=eps_c2d / 1000.0, **f_cd_kwarg,
     )
 
-    st.header("Bewehrungsstahl")
+    st.header("Betonstahl")
     stahl_optionen = ["Manuell"] + list(STAHL_KLASSEN.keys())
     stahl_klasse = st.selectbox("Betonstahlsorte (SIA 262:2025 Bemessungswerte)", stahl_optionen,
                                  index=stahl_optionen.index("B500B"))
