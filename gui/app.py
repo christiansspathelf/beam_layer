@@ -34,6 +34,7 @@ from beam_layer import (  # noqa: E402
     LayeredBeamSection,
     RebarFace,
     SteelMaterial,
+    UltimateLoadResult,
     __version__,
     bar_y_positions_mm,
     compression_zone_check,
@@ -55,11 +56,14 @@ TENSION_STIFFENING = False
 
 # Per a user request: only "Einzellastanalyse" is shown to students for now (an
 # intentionally reduced scope for an initial teaching release, not a permanent
-# removal). The "Last-Verformungskurve"/"Traglastberechnung" tabs' code is fully
-# intact below - render_curve_tab()/render_ultimate_tab() are just not called
-# while this is False. Flip back to True (or expose as a checkbox) to restore
-# both tabs; no other code needs to change.
-SHOW_ALL_TABS = False
+# removal). Originally one SHOW_ALL_TABS flag gating both remaining tabs together;
+# split into two independent flags per a later user request to expose
+# "Traglastberechnung" on its own while keeping "Last-Verformungskurve" hidden.
+# render_curve_tab()/render_ultimate_tab()'s own bodies are untouched either way -
+# only whether each is called changed (see the tab-construction block and the
+# final `with tab_curve:`/`with tab_ultimate:` calls below).
+SHOW_CURVE_TAB = False
+SHOW_ULTIMATE_TAB = True
 
 CHANGELOG_PATH = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
 
@@ -231,6 +235,34 @@ def rebar_face_input(face: str, default_n: int, default_diam: float) -> RebarFac
 # figure/beam_elevation_figure (grep before reusing this constant elsewhere) -
 # other plots in this file keep their own `responsive=True`.
 CROSS_SECTION_CONFIG = dict(scrollZoom=False, displayModeBar=False, responsive=False)
+# A user reported the cross-section/Aufriss rendering noticeably smaller inside
+# "Traglastberechnung" than the identical figure in "Einzellastanalyse". Root
+# cause: Streamlit's `st.tabs` renders every tab's content into the DOM on
+# every script run (not lazily on first selection - this project's own
+# SHOW_CURVE_TAB/SHOW_ULTIMATE_TAB flags exist specifically to skip computing
+# a hidden tab's content in Python, which would be pointless if the frontend
+# only mounted the active tab's DOM anyway); CSS then hides the inactive
+# tab(s). A Plotly chart that first mounts inside such a CSS-hidden (zero-
+# width) container captures that width at its initial render, and - with
+# `CROSS_SECTION_CONFIG`'s `responsive=False` - never re-measures once the
+# tab becomes visible, so it stays stuck at (near-)zero/tiny. This is a
+# well-known Plotly-in-hidden-tabs gotcha, not something a declared-property
+# mismatch (the usual culprit in this figure's long scale-matching history -
+# see `combined_geometry_figure`'s own docstring) would explain or fix.
+# "Einzellastanalyse" never hit this because `st.tabs` always makes the
+# *first* tab the active/visible one at mount, so its chart's first render
+# already happens in a full-width container.
+#
+# `combined_geometry_figure` has no explicit-pixel-width figure to protect
+# the way `beam_elevation_figure` does (it fills its container via
+# `width="stretch"`, self-consistent via its own shared subplot y-axes, not
+# matched against a second figure) - so letting *it* resize freely on
+# becoming visible is safe. Used only for its own call sites inside a tab
+# that is not the default-active one (currently just "Traglastberechnung");
+# "Einzellastanalyse"'s own call stays on `CROSS_SECTION_CONFIG` since it
+# never had this problem - don't "fix" it there too without a reason, per
+# this project's own history of fixes that looked harmless but weren't.
+COMBINED_GEOMETRY_NONDEFAULT_TAB_CONFIG = dict(scrollZoom=False, displayModeBar=False, responsive=True)
 # Figure height for the "Querschnittsgeometrie" expander's `combined_geometry_
 # figure` (both its subplots) and for standalone `beam_elevation_figure`, per a
 # user request to enlarge it (~35% over the original 380, so it reads more
@@ -1193,11 +1225,74 @@ direction = BeamSectionForces(n_x=dir_n_x, v_z=0.0, m_y=dir_m_y)
 direction_norm = float(np.linalg.norm(direction.to_vector()))
 
 
-def _failure_prognosis(diag: FailureDiagnosis) -> str:
-    if diag.concrete_crushed and diag.reinforcement_ruptured:
-        return "Betondruckversagen und Bewehrungsbruch"
+def _steel_yielded_at_state(section: LayeredBeamSection, steel: SteelMaterial, result) -> bool:
+    """Whether the *tension-side* reinforcement's strain at this *converged*
+    (eps0, kappa) state has already reached the yield strain fy/Es. Used by
+    the ultimate-load tab instead of `FailureDiagnosis.reinforcement_yielded`
+    for its prognosis - that field, like `concrete_crushed`, is necessarily
+    evaluated at the *failing* bisection probe (kappa_hi) one level up, not
+    at the converged capacity state (kappa_u) actually shown. Empirically
+    verified this matters, not just a theoretical concern: once the solver
+    fails to converge, its last attempted iterate can overshoot strains far
+    past both fy/Es *and* eps_su even for a heavily over-reinforced section
+    that, at its own true (converged) capacity state, hasn't yielded at
+    all - the failing probe isn't a clean "just past the limit" snapshot.
+    Checking the converged state instead answers the question that's
+    actually pedagogically relevant: did the tension steel yield in the
+    capacity state being shown, at all.
+
+    **Tension side only** (`e > 0`, this project's tension-positive
+    convention) - not "either row" by absolute value: the *compression*-side
+    row, if any, sits close to the crushing fibre by construction and its
+    strain there routinely exceeds fy/Es too (eps_c2d=3.5permil > a typical
+    fy/Es~2.4permil) regardless of whether the section is under- or
+    over-reinforced - including compression yielding would make this check
+    `True` almost unconditionally and defeat the whole point of
+    distinguishing the two cases. A first version checked `abs(e)` for
+    either row and, caught via a scripted check (not visually), reported
+    "normalbewehrt" even for a deliberately heavily over-reinforced test
+    section whose tension steel strain at kappa_u was a small fraction of
+    fy/Es - this fixes that."""
+    yield_strain = steel.fy / steel.Es
+    for row in (section.bottom_row, section.top_row):
+        if row.area_total_mm2 <= 0.0:
+            continue
+        e = strain_at(row.z, result.eps0, result.kappa)
+        if e > 0 and e >= yield_strain:
+            return True
+    return False
+
+
+def _failure_prognosis(diag: FailureDiagnosis, reinforcement_yielded: Optional[bool] = None) -> str:
+    """`reinforcement_yielded` overrides `diag.reinforcement_yielded` when
+    given - the ultimate-load tab passes a value computed at the actual
+    converged capacity state instead (see `_steel_yielded_at_state`); the
+    single-load tab leaves it `None` and gets the library's own value,
+    which is the best available there (there is no separate converged
+    state to check - `result` passed to `diagnose_failure` *is* the
+    non-converged state being diagnosed, same as for `concrete_crushed`)."""
+    yielded = diag.reinforcement_yielded if reinforcement_yielded is None else reinforcement_yielded
+    # Per a user request: a flat "Betondruckversagen" reads as if something went
+    # wrong, when - for the typical normally-reinforced case - the tension steel
+    # has already yielded by this point, which is the ductile failure mechanism
+    # actually taught/intended in RC design (SIA 262:2025 §4.1.4.2.5's own x_c/d_s
+    # ductility check, `ductility_check.py`, exists specifically to keep sections
+    # in this regime). Distinguish it from the rarer, brittle over-reinforced case
+    # (concrete crushes before the steel ever yields) instead of reporting both
+    # the same way. This also replaces the old separate "crushed and ruptured"
+    # branch - rupture implies yielding (`fu >= fy`), so that combination is a
+    # subset of "crushed and yielded", not a reason for a different headline.
+    if diag.concrete_crushed and yielded:
+        return (
+            "Normalbewehrter Querschnitt: Betondruckversagen in der äussersten gedrückten Faser, "
+            "während der Betonstahl bereits die Fliessgrenze erreicht hat (duktiles, im "
+            "Stahlbetonbau angestrebtes Versagen)"
+        )
     if diag.concrete_crushed:
-        return "Betondruckversagen (Druckbruch des Betons)"
+        return (
+            "Überbewehrter Querschnitt: Betondruckversagen, ohne dass der Betonstahl die "
+            "Fliessgrenze erreicht hat (sprödes Versagen - im Stahlbetonbau zu vermeiden)"
+        )
     if diag.reinforcement_ruptured:
         return "Bewehrungsbruch (Stahldehnung über εsu)"
     if diag.verdict == "likely_physical_limit":
@@ -1265,30 +1360,41 @@ def _render_force_resultants(fr: ForceResultants) -> None:
         )
 
 
-def _live_material_curves():
+def _live_material_curves(section: Optional[LayeredBeamSection] = None, result=None):
     """Steel/concrete characteristic curves computed from the current
-    sidebar materials alone, plus (only once a converged result exists in
-    session_state - "the active points should only be added after
-    convergence") marker points read from that stored result. Returns
-    (eps_range_steel, sigma_range_steel, steel_points, eps_max_steel,
-    concrete_points, eps_max_concrete).
+    sidebar materials alone, plus (only once a converged result exists -
+    "the active points should only be added after convergence") marker
+    points read from that result. Returns (eps_range_steel,
+    sigma_range_steel, steel_points, eps_max_steel, concrete_points,
+    eps_max_concrete).
 
-    **Must be called after** the "Analyse durchführen" button/solve block,
-    not before - even though the figures render in the "Werkstoffgesetze
-    (Live-Vorschau)" expander *above* that button (via `st.empty()`
-    placeholders reserved there and filled after this call returns).
-    Streamlit re-executes the whole script exactly once per interaction;
-    calling this before the solve block would read `st.session_state
-    ["result"]` as it was *before* the click that just updated it, so the
-    new marker point would only ever appear one interaction late - it did,
-    once, before this was restructured. Don't move the call back above the
-    button without re-introducing that.
+    `section`/`result` default to `None`, in which case this reads the
+    single-load tab's own `st.session_state["section_for_result"]`/
+    `["result"]` exactly as this function always has - the ultimate-load
+    tab has its own, separate solved state (a different loading
+    combination than the live sidebar `direction`) and passes it in
+    explicitly instead, per a user request that it show the identical
+    kind of plots the single-load tab does.
+
+    **Must be called after** the relevant solve block, not before - even
+    though the figures render in the "Werkstoffgesetze (Live-Vorschau)"
+    expander *above* that solve's button (via `st.empty()` placeholders
+    reserved there and filled after this call returns). Streamlit
+    re-executes the whole script exactly once per interaction; calling
+    this before the solve block would read last run's solved state, so
+    the new marker point would only ever appear one interaction late - it
+    did, once, before this was restructured. Don't move either call site
+    back above its button without re-introducing that.
     """
+    if section is None and result is None:
+        section = st.session_state.get("section_for_result")
+        result = st.session_state.get("result")
+
     steel_points: list = []
     concrete_points: list = []
-    if st.session_state.get("result") is not None and st.session_state["result"].converged:
-        r_section = st.session_state["section_for_result"]
-        r_result = st.session_state["result"]
+    if result is not None and result.converged:
+        r_section = section
+        r_result = result
         _, r_layer_data = r_section.internal_forces(r_result.eps0, r_result.kappa)
         r_bottom_resp = next(s for kind, z, s in r_layer_data if kind == "reinforcement" and z > 0)
         r_top_resp = next(s for kind, z, s in r_layer_data if kind == "reinforcement" and z < 0)
@@ -1296,9 +1402,29 @@ def _live_material_curves():
         r_ex_b = strain_at(r_section.bottom_row.z, r_result.eps0, r_result.kappa)
         r_ex_t = strain_at(r_section.top_row.z, r_result.eps0, r_result.kappa)
         steel_points = [("inf", r_ex_b * 1000, r_bottom_resp.sigma), ("sup", r_ex_t * 1000, r_top_resp.sigma)]
+
+        def _concrete_marker_point(label: str, fibre_state) -> tuple:
+            """Per a user request: once a fibre's strain is past the cracking
+            strain, `uniaxial_concrete.py`'s own law already returns sigma=0
+            regardless of how much further the strain grows (a brittle
+            cutoff - or, with tension excluded by default, sigma=0 for any
+            eps>=0 at all, scoping decision 7) - a cracked fibre's strain can
+            grow arbitrarily large (it just follows the kinematic field,
+            nothing in the concrete law bounds it, unlike the compression
+            side's hard eps_c2d cutoff). Plotting that far-out, still-zero-
+            stress point at its *true* strain forces the whole x-axis to
+            stretch to fit it, squashing the actually-informative
+            compression-side curve into a sliver - clamped to the origin
+            here instead, display-only (the real (eps, sigma) pair, always
+            well-defined, is what `strain_stress_figure`/the force
+            resultants still use)."""
+            if fibre_state.eps >= concrete.eps_cr:
+                return (label, 0.0, 0.0)
+            return (label, fibre_state.eps * 1000, fibre_state.sigma)
+
         concrete_points = [
-            ("inf", r_concrete_entries[-1][1].eps * 1000, r_concrete_entries[-1][1].sigma),
-            ("sup", r_concrete_entries[0][1].eps * 1000, r_concrete_entries[0][1].sigma),
+            _concrete_marker_point("inf", r_concrete_entries[-1][1]),
+            _concrete_marker_point("sup", r_concrete_entries[0][1]),
         ]
 
     eps_max_steel = max(
@@ -1318,15 +1444,93 @@ def _live_material_curves():
     return eps_range_steel, sigma_range_steel, steel_points, eps_max_steel, concrete_points, eps_max_concrete
 
 
-if SHOW_ALL_TABS:
-    tab_single, tab_curve, tab_ultimate = st.tabs(
-        ["Einzellastanalyse", "Last-Verformungskurve", "Traglastberechnung"]
-    )
+def _render_solved_state_plots(section: LayeredBeamSection, params: BeamParameters, steel: SteelMaterial,
+                                result, key_suffix: str) -> None:
+    """The "Resultierender Dehnungs- und Spannungszustand" expander (strain
+    state, steel/concrete fibre stresses, force resultants, the strain/
+    stress figure) plus the compression-zone ductility check container -
+    factored out of the single-load tab so `render_ultimate_tab` can show
+    the identical plots for the ultimate-load state, per a user request
+    ("exactly the same plots as in Einzellastanalyse") instead of
+    duplicating this block or showing only a summary line as the ultimate
+    tab originally did. `result` must be a converged `BeamAnalysisResult`
+    (callers check `result.converged` before calling this, same as the
+    single-load tab always has). `key_suffix` must be unique per caller -
+    Streamlit auto-generates a `plotly_chart` element's id from its content,
+    and the single-load/ultimate-load tabs can otherwise end up rendering
+    literally identical figures (e.g. both converge to the same state),
+    which raises `StreamlitDuplicateElementId` without an explicit key."""
+    _, layer_data = section.internal_forces(result.eps0, result.kappa)
+    bottom_resp = next(s for kind, z, s in layer_data if kind == "reinforcement" and z > 0)
+    top_resp = next(s for kind, z, s in layer_data if kind == "reinforcement" and z < 0)
+    concrete_entries = [(z, s) for kind, z, s in layer_data if kind == "concrete"]
+    sigma_c_bottom = concrete_entries[-1][1]
+    sigma_c_top = concrete_entries[0][1]
+
+    with st.expander("Resultierender Dehnungs- und Spannungszustand", expanded=True):
+        st.latex(
+            r"\varepsilon_0=%.4f\text{‰}\qquad\chi=%.4f\,\text{mrad/m}"
+            % (result.eps0 * 1000, result.kappa * 1000)
+        )
+        st.latex(
+            r"[\sigma_{s,\mathrm{inf}},\ \sigma_{s,\mathrm{sup}}]="
+            r"[%.1f,\ %.1f]\,\text{N/mm}^2"
+            % (bottom_resp.sigma, top_resp.sigma)
+        )
+        st.latex(
+            r"[\sigma_{c,\mathrm{inf}},\ \sigma_{c,\mathrm{sup}}]="
+            r"[%.2f,\ %.2f]\,\text{N/mm}^2"
+            % (sigma_c_bottom.sigma, sigma_c_top.sigma)
+        )
+        _render_force_resultants(section.force_resultants(result.eps0, result.kappa))
+        st.plotly_chart(strain_stress_figure(section, result.eps0, result.kappa),
+                         width="stretch", config=dict(responsive=True), key=f"strain_stress_{key_suffix}")
+
+    with st.container(border=True):
+        st.markdown("**Nachweis Druckzonenhöhe (SIA 262:2025 §4.1.4.2.5)**")
+        ductility = compression_zone_check(params, steel, result.eps0, result.kappa)
+        if ductility is None:
+            st.caption(
+                "Nicht anwendbar für diesen Zustand (keine Krümmung oder keine Nulllinie "
+                "innerhalb des Querschnitts)."
+            )
+        else:
+            status = "eingehalten" if ductility.ok else "nicht eingehalten"
+            st.latex(
+                r"x_c=%.1f\,\text{mm}\qquad d_s=%.1f\,\text{mm}\qquad "
+                r"x_c/d_s=%.3f\ %s\ 0{,}35\cdot435/f_{yd}=%.3f"
+                % (ductility.x_c * 1000, ductility.d_s * 1000, ductility.ratio,
+                   r"\le" if ductility.ok else ">", ductility.limit)
+            )
+            st.caption(
+                f"{'✓' if ductility.ok else '✗'} {status} (Zugbewehrung: {ductility.tension_face}) - "
+                "Kriterium für die Umlagerung ohne rechnerischen Nachweis des "
+                "Verformungsvermögens, hier informativ auf den vorliegenden Querschnitt "
+                "angewendet."
+            )
+
+
+_tab_labels = ["Einzellastanalyse"]
+if SHOW_CURVE_TAB:
+    _tab_labels.append("Last-Verformungskurve")
+if SHOW_ULTIMATE_TAB:
+    _tab_labels.append("Traglastberechnung")
+
+if len(_tab_labels) > 1:
+    # Tabs are consumed in the same order they were appended above, so this
+    # works for any combination of the two flags (one, the other, both, or -
+    # via the `else` below - neither).
+    _tabs_iter = iter(st.tabs(_tab_labels))
+    tab_single = next(_tabs_iter)
+    tab_curve = next(_tabs_iter) if SHOW_CURVE_TAB else None
+    tab_ultimate = next(_tabs_iter) if SHOW_ULTIMATE_TAB else None
 else:
     # A single st.tabs(["Einzellastanalyse"]) would still draw a (pointless,
     # single-item) tab strip - a plain container reads cleaner when there's
     # only ever going to be one section.
     tab_single = st.container()
+    tab_curve = None
+    tab_ultimate = None
 
 with tab_single:
     if direction_norm == 0:
@@ -1442,61 +1646,14 @@ with tab_single:
                     section, direction_for_result, result, diagnosis, key_suffix="single"
                 )
 
-            _, layer_data = section.internal_forces(result.eps0, result.kappa)
-            bottom_resp = next(s for kind, z, s in layer_data if kind == "reinforcement" and z > 0)
-            top_resp = next(s for kind, z, s in layer_data if kind == "reinforcement" and z < 0)
-            concrete_entries = [(z, s) for kind, z, s in layer_data if kind == "concrete"]
-            sigma_c_bottom = concrete_entries[-1][1]
-            sigma_c_top = concrete_entries[0][1]
-
-            with st.expander("Resultierender Dehnungs- und Spannungszustand", expanded=True):
-                st.latex(
-                    r"\varepsilon_0=%.4f\text{‰}\qquad\chi=%.4f\,\text{mrad/m}"
-                    % (result.eps0 * 1000, result.kappa * 1000)
-                )
-                st.latex(
-                    r"[\sigma_{s,\mathrm{inf}},\ \sigma_{s,\mathrm{sup}}]="
-                    r"[%.1f,\ %.1f]\,\text{N/mm}^2"
-                    % (bottom_resp.sigma, top_resp.sigma)
-                )
-                st.latex(
-                    r"[\sigma_{c,\mathrm{inf}},\ \sigma_{c,\mathrm{sup}}]="
-                    r"[%.2f,\ %.2f]\,\text{N/mm}^2"
-                    % (sigma_c_bottom.sigma, sigma_c_top.sigma)
-                )
-                _render_force_resultants(section.force_resultants(result.eps0, result.kappa))
-                st.plotly_chart(strain_stress_figure(section, result.eps0, result.kappa),
-                                 width="stretch", config=dict(responsive=True))
-
-            with st.container(border=True):
-                st.markdown("**Nachweis Druckzonenhöhe (SIA 262:2025 §4.1.4.2.5)**")
-                ductility = compression_zone_check(params, steel, result.eps0, result.kappa)
-                if ductility is None:
-                    st.caption(
-                        "Nicht anwendbar für diesen Zustand (keine Krümmung oder keine Nulllinie "
-                        "innerhalb des Querschnitts)."
-                    )
-                else:
-                    status = "eingehalten" if ductility.ok else "nicht eingehalten"
-                    st.latex(
-                        r"x_c=%.1f\,\text{mm}\qquad d_s=%.1f\,\text{mm}\qquad "
-                        r"x_c/d_s=%.3f\ %s\ 0{,}35\cdot435/f_{yd}=%.3f"
-                        % (ductility.x_c * 1000, ductility.d_s * 1000, ductility.ratio,
-                           r"\le" if ductility.ok else ">", ductility.limit)
-                    )
-                    st.caption(
-                        f"{'✓' if ductility.ok else '✗'} {status} (Zugbewehrung: {ductility.tension_face}) - "
-                        "Kriterium für die Umlagerung ohne rechnerischen Nachweis des "
-                        "Verformungsvermögens, hier informativ auf den vorliegenden Querschnitt "
-                        "angewendet."
-                    )
+            _render_solved_state_plots(section, params, steel, result, key_suffix="single")
         else:
             st.info("Auf **Analyse durchführen** klicken.")
 
 def render_curve_tab() -> None:
     """"Last-Verformungskurve" tab body - kept as a plain function (not a
     `with tab_curve:` block) so it can be skipped entirely (not just hidden)
-    when `SHOW_ALL_TABS` is `False`, per a user request to ship a reduced-
+    when `SHOW_CURVE_TAB` is `False`, per a user request to ship a reduced-
     scope version to students without deleting this tab's code. Only ever
     called from inside `with tab_curve:` at the bottom of this file, same as
     every other tab body was written to run directly at that indentation
@@ -1671,76 +1828,179 @@ def render_curve_tab() -> None:
         else:
             st.info("Auf **Last-Verformungskurve berechnen** klicken.")
 
+# Per a user request: no manual "search up to kappa=..." input - the search
+# instead starts at a modest bound and doubles it (1024x cap, a runaway-loop
+# guard only - not expected to ever actually bind for a real section, the
+# same "safety cap, not a tuning knob" role `load_sweep.sweep_curvature`'s own
+# `max_points` plays) until `find_ultimate_load` finds a genuine capacity
+# limit. This is a thin GUI-layer wrapper, not a library change: the library
+# function itself still needs a `max_kappa` to bracket within (it's a
+# bracket-then-bisect search, not an open-ended stepping sweep like
+# `sweep_curvature`), so the "no upfront bound" experience is produced here by
+# retrying with a bigger one rather than by changing that algorithm itself.
+_ULTIMATE_INITIAL_MAX_KAPPA = 2.0
+_ULTIMATE_MAX_KAPPA_SAFETY_CAP = 1024.0
+# Per a user request ("try to reach 0.5%") - no longer a GUI slider, since a
+# student has no real reason to trade this off; was `_DEFAULT_REL_TOL` (1%).
+_ULTIMATE_REL_TOL = 0.005
+
+
+def _find_ultimate_load_auto(section: LayeredBeamSection, direction: BeamSectionForces
+                              ) -> Optional[UltimateLoadResult]:
+    """Finds the ultimate load factor without requiring an upfront upper
+    bound from the caller - see the module constants' own comment above for
+    why this wraps `find_ultimate_load` rather than changing it. Returns
+    `None` only if `_ULTIMATE_MAX_KAPPA_SAFETY_CAP` itself is reached
+    without ever finding a capacity limit - practically never expected for
+    a real section (every material law here has a hard cutoff strain, so a
+    large enough load factor always eventually fails it)."""
+    max_kappa = _ULTIMATE_INITIAL_MAX_KAPPA
+    while max_kappa <= _ULTIMATE_MAX_KAPPA_SAFETY_CAP:
+        result = find_ultimate_load(section, direction, max_kappa=max_kappa, rel_tol=_ULTIMATE_REL_TOL)
+        if result is not None:
+            return result
+        max_kappa *= 2.0
+    return None
+
+
 def render_ultimate_tab() -> None:
     """"Traglastberechnung" tab body - see `render_curve_tab`'s docstring
     for why this is a plain function now instead of a `with tab_ultimate:`
-    block."""
+    block. Shows the identical geometry/material-law/strain-stress/
+    ductility plots the single-load tab shows (via `_live_material_curves`/
+    `_render_solved_state_plots`, both shared with it) for the ultimate-load
+    state, per a user request ("exactly the same plots") - not just the
+    κ_u/forces summary this tab originally had alone. Structured the same
+    way as `tab_single` below for the same reason that one is (the
+    `st.empty()` placeholders reserved before the button and filled after -
+    see `_live_material_curves`'s docstring for why that order matters)."""
     if direction_norm == 0:
         st.error("Definiere in der Seitenleiste eine von Null verschiedene Einwirkung.")
-    else:
-        st.caption(
-            "Findet den Traglastfaktor $\\kappa_u$ - die grösste Skalierung der in der "
-            "Seitenleiste angegebenen Einwirkung, die der Querschnitt aufnehmen kann - über "
-            "eine Grob-/Bisektionssuche: eine günstige grobe Laststeigerung grenzt eine echte "
-            "Tragfähigkeitsgrenze ein, danach verfeinert eine Bisektion $\\kappa_u$ auf die "
-            "gewünschte Genauigkeit. Zeigt zudem den massgebenden Versagensmechanismus "
-            "(Betondruckversagen oder Bewehrungsbruch)."
+        return
+
+    st.caption(
+        "Sucht den Traglastfaktor $\\kappa_u$ - die grösste Skalierung der in der Seitenleiste "
+        "angegebenen Einwirkung ($N_x$/$M_y$ im gleichen Verhältnis) - durch automatische "
+        "Laststeigerung bis zum Versagen (Betondruckversagen oder Bewehrungsbruch); keine "
+        "manuelle Obergrenze nötig. Die Genauigkeit ist fest auf 0.5% von $\\kappa_u$ eingestellt."
+    )
+
+    with st.expander("Querschnittsgeometrie bei Traglast", expanded=True):
+        geometry_slot = st.empty()
+
+    with st.expander("Werkstoffgesetze (Live-Vorschau)", expanded=True):
+        char_col1, char_col2 = st.columns(2)
+        steel_chart_slot = char_col1.empty()
+        concrete_chart_slot = char_col2.empty()
+
+    btn_col, status_col = st.columns([1, 4], vertical_alignment="center")
+    with btn_col:
+        find_ultimate = st.button("Traglast berechnen", type="primary", key="ultimate_btn")
+
+    if find_ultimate:
+        section = LayeredBeamSection(params, concrete, steel, tension_stiffening=TENSION_STIFFENING,
+                                      n_concrete_layers=n_concrete_layers)
+        with status_col:
+            with st.spinner("Automatische Laststeigerung und Verfeinerung des Traglastfaktors..."):
+                ultimate_result = _find_ultimate_load_auto(section, direction)
+        st.session_state["ultimate_result"] = ultimate_result
+        st.session_state["ultimate_direction"] = direction
+        st.session_state["ultimate_section"] = section
+        # Re-solve once at the achieved ultimate forces (kappa_u is, by
+        # construction, the last factor `find_ultimate_load` confirmed
+        # converges) so the plots below have an (eps0, kappa) state to show -
+        # `UltimateLoadResult` itself only carries the scalar kappa_u, not the
+        # full solved state at it.
+        st.session_state["ultimate_solved"] = (
+            solve(section, direction.scaled(ultimate_result.kappa_u)) if ultimate_result is not None else None
         )
-        ult_col1, ult_col2 = st.columns(2)
-        with ult_col1:
-            ultimate_max_kappa = st.number_input(
-                r"Suche bis maximal $\kappa$ ($\kappa=1$ = Last gemäss Seitenleiste)",
-                min_value=0.1, value=5.0, step=0.5,
-            )
-        with ult_col2:
-            ultimate_tol_pct = st.slider(
-                r"Genauigkeit [% von $\kappa_u$]", min_value=0.1, max_value=5.0, value=1.0, step=0.1,
-            )
-        find_ultimate = st.button("Traglast berechnen", type="primary")
 
-        if find_ultimate:
-            section = LayeredBeamSection(params, concrete, steel, tension_stiffening=TENSION_STIFFENING,
-                                          n_concrete_layers=n_concrete_layers)
-            with st.spinner("Eingrenzung und Verfeinerung des Traglastfaktors..."):
-                ultimate_result = find_ultimate_load(
-                    section, direction, max_kappa=ultimate_max_kappa, rel_tol=ultimate_tol_pct / 100.0
-                )
-            st.session_state["ultimate_result"] = ultimate_result
-            st.session_state["ultimate_direction"] = direction
-            st.session_state["ultimate_max_kappa"] = ultimate_max_kappa
+    ult_section = st.session_state.get("ultimate_section")
+    ult_solved = st.session_state.get("ultimate_solved")
+    (eps_range_steel, sigma_range_steel, steel_points, eps_max_steel,
+     concrete_points, eps_max_concrete) = _live_material_curves(ult_section, ult_solved)
+    steel_chart_slot.plotly_chart(
+        steel_characteristic_figure(eps_range_steel, sigma_range_steel, steel_points, eps_max_steel),
+        width="stretch", config=CHAR_CONFIG, key="ultimate_steel_chart",
+    )
+    concrete_chart_slot.plotly_chart(
+        concrete_characteristic_figure(concrete, concrete_points, eps_max_concrete),
+        width="stretch", config=CHAR_CONFIG, key="ultimate_concrete_chart",
+    )
 
-        if "ultimate_result" in st.session_state:
-            ultimate_result = st.session_state["ultimate_result"]
-            ultimate_direction = st.session_state["ultimate_direction"]
+    if "ultimate_result" not in st.session_state:
+        geometry_slot.plotly_chart(
+            combined_geometry_figure(params, dir_n_x, dir_m_y, None),
+            width="stretch", config=COMBINED_GEOMETRY_NONDEFAULT_TAB_CONFIG, key="ultimate_geometry_chart",
+        )
+        st.info("Auf **Traglast berechnen** klicken.")
+        return
 
-            if ultimate_result is None:
-                st.warning(
-                    f"Bis $\\kappa$={st.session_state['ultimate_max_kappa']:.2f} wurde keine "
-                    "Tragfähigkeitsgrenze gefunden - maximalen Suchbereich vergrössern."
-                )
-            else:
-                achieved = ultimate_direction.scaled(ultimate_result.kappa_u)
+    ultimate_result = st.session_state["ultimate_result"]
+    if ultimate_result is None:
+        geometry_slot.plotly_chart(
+            combined_geometry_figure(params, dir_n_x, dir_m_y, None),
+            width="stretch", config=COMBINED_GEOMETRY_NONDEFAULT_TAB_CONFIG, key="ultimate_geometry_chart",
+        )
+        st.warning(
+            f"Bis zur {_ULTIMATE_MAX_KAPPA_SAFETY_CAP:.0f}-fachen Laststeigerung wurde keine "
+            "Tragfähigkeitsgrenze gefunden - ungewöhnlich, bitte Eingaben prüfen."
+        )
+        return
 
-                with st.container(border=True):
-                    st.markdown(f"### $\\kappa_u = {ultimate_result.kappa_u:.3f}$")
-                    st.markdown(f"**{_failure_prognosis(ultimate_result.diagnosis)}**")
-                    for reason in ultimate_result.diagnosis.reasons:
-                        st.markdown(f"- {reason}")
-                    st.caption(
-                        f"Eingrenzung: $\\kappa \\in [{ultimate_result.kappa_lo:.4f},\\ "
-                        f"{ultimate_result.kappa_hi:.4f}]$ — {ultimate_result.n_solves} Berechnungen total."
-                    )
+    section = ult_section
+    ultimate_direction = st.session_state["ultimate_direction"]
+    achieved = ultimate_direction.scaled(ultimate_result.kappa_u)
+    result = ult_solved
 
-                st.latex(
-                    r"N_x=%.2f\,\text{kN}\qquad M_y=%.2f\,\text{kNm}"
-                    % (achieved.n_x, achieved.m_y)
-                )
-        else:
-            st.info("Maximales $\\kappa$ / Genauigkeit festlegen und auf **Traglast berechnen** klicken.")
+    force_resultants_ultimate = (
+        section.force_resultants(result.eps0, result.kappa) if result.converged else None
+    )
+    geometry_slot.plotly_chart(
+        combined_geometry_figure(params, achieved.n_x, achieved.m_y, force_resultants_ultimate),
+        width="stretch", config=COMBINED_GEOMETRY_NONDEFAULT_TAB_CONFIG, key="ultimate_geometry_chart",
+    )
+
+    # Checked at the actual converged kappa_u state, not ultimate_result.diagnosis's
+    # own reinforcement_yielded (evaluated at the failing kappa_hi probe one level
+    # up, which overshoots too much to tell a normally- from an over-reinforced
+    # section apart - see _steel_yielded_at_state's docstring). Falls back to the
+    # diagnosis's own value (via `reinforcement_yielded=None`) on the
+    # practically-never-expected case that re-solving at kappa_u itself didn't
+    # converge (handled further below).
+    yielded_at_u = _steel_yielded_at_state(section, steel, result) if result.converged else None
+    prognosis_text = _failure_prognosis(ultimate_result.diagnosis, reinforcement_yielded=yielded_at_u)
+
+    with status_col:
+        st.markdown(f"**$\\kappa_u = {ultimate_result.kappa_u:.3f}$** — {prognosis_text}")
+
+    with st.container(border=True):
+        st.markdown(f"### $\\kappa_u = {ultimate_result.kappa_u:.3f}$")
+        st.markdown(f"**{prognosis_text}**")
+        for reason in ultimate_result.diagnosis.reasons:
+            st.markdown(f"- {reason}")
+        st.latex(
+            r"N_x=%.2f\,\text{kN}\qquad M_y=%.2f\,\text{kNm}"
+            % (achieved.n_x, achieved.m_y)
+        )
+        st.caption(f"{ultimate_result.n_solves} Berechnungen total.")
+
+    if result.converged:
+        _render_solved_state_plots(section, params, steel, result, key_suffix="ultimate")
+    else:
+        # Not expected (see `_find_ultimate_load_auto`'s docstring) - kappa_u is
+        # the last factor already confirmed to converge during the search, so
+        # re-solving at exactly that point should too; shown instead of a crash
+        # if the solver's best-effort acceptance (see solver.py) ever disagrees.
+        st.warning(
+            "Erneutes Lösen beim Traglastzustand ist nicht konvergiert - unerwartet, da dieser "
+            "Zustand während der Suche bereits konvergiert war."
+        )
 
 
-if SHOW_ALL_TABS:
+if SHOW_CURVE_TAB:
     with tab_curve:
         render_curve_tab()
+if SHOW_ULTIMATE_TAB:
     with tab_ultimate:
         render_ultimate_tab()

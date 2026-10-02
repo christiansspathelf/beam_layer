@@ -43,6 +43,29 @@ class FailureDiagnosis:
     CLAUDE.md)."""
     reinforcement_ruptured: bool
     """Either reinforcement row's local strain at/beyond eps_su."""
+    reinforcement_yielded: bool
+    """Either reinforcement row's *tension-side* (positive, this project's
+    tension-positive convention) local strain at/beyond the yield strain
+    fy/Es - tension side only, not by absolute value: a *compression*-side
+    row, if any, sits close to the crushing fibre by construction, and its
+    strain there routinely exceeds fy/Es regardless of whether the section
+    is under- or over-reinforced (eps_c2d=0.0035 > a typical fy/Es~0.0024),
+    which would make this field True almost unconditionally and defeat its
+    own purpose if it counted that side too. Added per a user request:
+    distinguishing "concrete crushed after the tension steel had already
+    yielded" (a normally-reinforced section's intended, ductile failure
+    mode - ductility is *why* sections are designed this way, see SIA
+    262:2025 §4.1.4.2.5's own x_c/d_s check, `ductility_check.py`) from
+    "concrete crushed before the tension steel ever yielded" (an
+    over-reinforced, brittle failure) - `gui/app.py`'s `_failure_prognosis`
+    is where that distinction is actually surfaced to the user. Implied by
+    (not independent of) `reinforcement_ruptured` on the *same* row, since
+    eps_su > fy/Es always (`materials/steel.py`'s `fu >= fy` invariant) -
+    but `reinforcement_ruptured` itself checks both sides by absolute
+    value (unlike this field), since actual bar rupture needs strain far
+    beyond anything the compression side reaches near crushing (eps_su is
+    typically >10x eps_c2d), so that check has no equivalent false-positive
+    risk to guard against."""
     tangent_singular_ratio: float
     """Smallest/largest singular value of the tangent at the best-effort
     state - near 0 means the tangent is trending singular. NaN if the
@@ -68,7 +91,7 @@ def diagnose_failure(
     if result.converged:
         return FailureDiagnosis(
             verdict="converged", reasons=["Berechnung konvergiert (solve() meldet converged=True)"],
-            concrete_crushed=False, reinforcement_ruptured=False,
+            concrete_crushed=False, reinforcement_ruptured=False, reinforcement_yielded=False,
             tangent_singular_ratio=float("nan"), sweep=None,
         )
 
@@ -86,6 +109,8 @@ def diagnose_failure(
         )
 
     reinforcement_ruptured = False
+    reinforcement_yielded = False
+    yield_strain = section.steel.fy / section.steel.Es
     for row in (section.bottom_row, section.top_row):
         if row.area_total_mm2 <= 0.0:
             # No reinforcement on this face (per a user request to allow n_bars=0/
@@ -93,10 +118,17 @@ def diagnose_failure(
             # strain a bar *would* have at this depth.
             continue
         e = strain_at(row.z, result.eps0, result.kappa)
+        if e > 0 and e >= yield_strain:  # tension side only - see the field's own docstring
+            reinforcement_yielded = True
         if abs(e) >= section.steel.eps_su:
             reinforcement_ruptured = True
             reasons.append(f"Die Bewehrungsdehnung bei z={row.z:.4f} m hat eps_su erreicht.")
-            break
+    if reinforcement_yielded and concrete_crushed:
+        reasons.append(
+            "Der Betonstahl hat die Fliessgrenze (fy/Es) bereits erreicht, bevor die Betondehnung "
+            "die harte Modellgrenze für Betondruckversagen erreicht hat - das duktile, im "
+            "Stahlbetonbau angestrebte Versagen eines normalbewehrten Querschnitts."
+        )
 
     K = tangent_complex_step(section, result.eps0, result.kappa)
     singular_values = np.linalg.svd(K, compute_uv=False)
@@ -159,5 +191,6 @@ def diagnose_failure(
     return FailureDiagnosis(
         verdict=verdict, reasons=reasons,
         concrete_crushed=concrete_crushed, reinforcement_ruptured=reinforcement_ruptured,
+        reinforcement_yielded=reinforcement_yielded,
         tangent_singular_ratio=tangent_singular_ratio, sweep=sweep,
     )

@@ -25,6 +25,29 @@ it's a developer record, not GUI copy).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-02
+
+### Added
+
+- "Traglastberechnung"-Tab neben "Einzellastanalyse" wieder sichtbar: sucht
+  automatisch die Traglast für das in der Seitenleiste angegebene
+  N_x/M_y-Verhältnis (keine manuelle Obergrenze, Genauigkeit fest auf
+  0.5%), zeigt dieselben Diagramme wie "Einzellastanalyse"
+  (Querschnittsgeometrie, Werkstoffgesetze, Dehnungs-/Spannungszustand,
+  Nachweis Druckzonenhöhe) für den Traglastzustand.
+- Versagensprognose unterscheidet neu zwischen normalbewehrtem
+  (Betondruckversagen nachdem der Betonstahl bereits fliesst - duktil,
+  gewünscht) und überbewehrtem (Betondruckversagen ohne Fliessen - spröd)
+  Querschnitt, statt pauschal "Betondruckversagen" zu melden.
+
+### Fixed
+
+- Querschnittsgeometrie im Traglast-Tab erschien kleiner als im
+  Einzellast-Tab (Plotly-Darstellungsfehler bei zunächst inaktivem Tab).
+- Ein Betonpunkt im gerissenen Zustand (Zugdehnung über Rissdehnung)
+  konnte die Dehnungsachse der Werkstoffgesetz-Grafik verzerren - wird nun
+  für die Darstellung auf den Nullpunkt geklemmt.
+
 ## [0.2.2] - 2026-09-15
 
 ### Changed
