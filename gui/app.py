@@ -11,9 +11,12 @@ Run with:
     streamlit run gui/app.py
 """
 
+import csv
+import io
 import math
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -257,12 +260,67 @@ CROSS_SECTION_CONFIG = dict(scrollZoom=False, displayModeBar=False, responsive=F
 # the way `beam_elevation_figure` does (it fills its container via
 # `width="stretch"`, self-consistent via its own shared subplot y-axes, not
 # matched against a second figure) - so letting *it* resize freely on
-# becoming visible is safe. Used only for its own call sites inside a tab
-# that is not the default-active one (currently just "Traglastberechnung");
-# "Einzellastanalyse"'s own call stays on `CROSS_SECTION_CONFIG` since it
-# never had this problem - don't "fix" it there too without a reason, per
-# this project's own history of fixes that looked harmless but weren't.
-COMBINED_GEOMETRY_NONDEFAULT_TAB_CONFIG = dict(scrollZoom=False, displayModeBar=False, responsive=True)
+# becoming visible is safe, unlike `CROSS_SECTION_CONFIG` (`responsive=
+# False`, still needed for `beam_elevation_figure`'s own explicit-width
+# calls). This is why `_svg_export_config` below always sets
+# `responsive=True` - it's what every `combined_geometry_figure` call site
+# now uses (a dedicated `COMBINED_GEOMETRY_NONDEFAULT_TAB_CONFIG` constant
+# used to carry just this `responsive=True` fix on its own; superseded once
+# every chart needed a per-call, parameter-encoding config anyway for the
+# SVG-export feature below - don't reintroduce a separate constant for this
+# half of what `_svg_export_config` already does).
+
+# Every modebar button except the camera/download one - per a user request for a
+# way to save a plot as a vector graphic, `_svg_export_config` enables just that
+# one button (the full default modebar - zoom/pan/lasso/etc. - would be visual
+# noise for a teaching tool that doesn't otherwise need interactive zooming).
+_MODEBAR_DOWNLOAD_ONLY = [
+    "zoom2d", "pan2d", "select2d", "lasso2d", "zoomIn2d", "zoomOut2d",
+    "autoScale2d", "resetScale2d", "toggleSpikelines",
+    "hoverClosestCartesian", "hoverCompareCartesian",
+]
+
+
+def _svg_export_config(label: str, n_x: float, m_y: float) -> dict:
+    """Plotly config for a chart that should be exportable as a vector
+    graphic, per a user request - "eindeutige Zuordnung" to the input
+    parameters that produced it. Entirely client-side (Plotly.js's own
+    `toImage`, triggered from the modebar's download button - not
+    `fig.write_image`/kaleido): this project has a documented history of
+    kaleido/headless-chrome rendering being unreliable in this dev
+    environment (see CLAUDE.md's `beam_elevation_figure` saga, and a
+    session where a kaleido render simply hung and had to be killed) - the
+    browser's own native SVG serialization needs no server roundtrip and
+    doesn't share that risk.
+
+    The filename (`toImageButtonOptions.filename` - Plotly appends its own
+    `.svg` extension) encodes `label` (which figure/tab) plus the current
+    section geometry and the *actual* forces being shown in `n_x`/`m_y` -
+    callers pass the live sidebar `dir_n_x`/`dir_m_y` for the single-load
+    tab, but the *achieved* (scaled) forces for the ultimate-load tab,
+    since that's what that chart actually depicts, not the sidebar's raw
+    ratio. This is computed fresh on every Streamlit rerun (the whole
+    script re-executes per interaction), so the filename always matches
+    what's on screen in that same run - never a stale combination from an
+    earlier click.
+
+    Only the download button is kept (`modeBarButtonsToRemove` strips
+    every other one) - `format="svg"` overrides Plotly's own PNG default.
+    `responsive=True` throughout (unlike `CROSS_SECTION_CONFIG`, which
+    `beam_elevation_figure`'s separate explicit-pixel-width calls still
+    need `False` for - see that constant's own comment): every figure
+    using this config is self-contained (no second figure to keep in
+    scale-sync with), so there's no equivalent risk."""
+    tag = f"{label}_h{params.height * 1000:.0f}_b{params.width * 1000:.0f}_Nx{n_x:.0f}_My{m_y:.0f}"
+    return dict(
+        scrollZoom=False,
+        displayModeBar=True,
+        modeBarButtonsToRemove=_MODEBAR_DOWNLOAD_ONLY,
+        toImageButtonOptions=dict(format="svg", filename=tag, scale=1),
+        responsive=True,
+    )
+
+
 # Figure height for the "Querschnittsgeometrie" expander's `combined_geometry_
 # figure` (both its subplots) and for standalone `beam_elevation_figure`, per a
 # user request to enlarge it (~35% over the original 380, so it reads more
@@ -976,7 +1034,10 @@ def strain_stress_figure(section: LayeredBeamSection, eps0: float, kappa: float)
     return fig
 
 
-CHAR_CONFIG = dict(scrollZoom=False, displayModeBar=False, responsive=True)
+# `CHAR_CONFIG` (a static `displayModeBar=False` dict) used to be shared by every
+# steel/concrete characteristic-curve chart - superseded by `_svg_export_config`
+# (see that function's own docstring), which every such call site uses now
+# instead, each with its own parameter-encoding filename.
 
 
 def steel_characteristic_figure(eps_range_permil: np.ndarray, sigma_range: np.ndarray, points: list,
@@ -1460,7 +1521,7 @@ def _render_solved_state_plots(section: LayeredBeamSection, params: BeamParamete
     and the single-load/ultimate-load tabs can otherwise end up rendering
     literally identical figures (e.g. both converge to the same state),
     which raises `StreamlitDuplicateElementId` without an explicit key."""
-    _, layer_data = section.internal_forces(result.eps0, result.kappa)
+    F, layer_data = section.internal_forces(result.eps0, result.kappa)
     bottom_resp = next(s for kind, z, s in layer_data if kind == "reinforcement" and z > 0)
     top_resp = next(s for kind, z, s in layer_data if kind == "reinforcement" and z < 0)
     concrete_entries = [(z, s) for kind, z, s in layer_data if kind == "concrete"]
@@ -1483,8 +1544,11 @@ def _render_solved_state_plots(section: LayeredBeamSection, params: BeamParamete
             % (sigma_c_bottom.sigma, sigma_c_top.sigma)
         )
         _render_force_resultants(section.force_resultants(result.eps0, result.kappa))
-        st.plotly_chart(strain_stress_figure(section, result.eps0, result.kappa),
-                         width="stretch", config=dict(responsive=True), key=f"strain_stress_{key_suffix}")
+        st.plotly_chart(
+            strain_stress_figure(section, result.eps0, result.kappa), width="stretch",
+            config=_svg_export_config(f"dehnung_spannung_{key_suffix}", F[0], F[1]),
+            key=f"strain_stress_{key_suffix}",
+        )
 
     with st.container(border=True):
         st.markdown("**Nachweis Druckzonenhöhe (SIA 262:2025 §4.1.4.2.5)**")
@@ -1508,6 +1572,144 @@ def _render_solved_state_plots(section: LayeredBeamSection, params: BeamParamete
                 "Verformungsvermögens, hier informativ auf den vorliegenden Querschnitt "
                 "angewendet."
             )
+
+
+# ---------------------------------------------------------------------------
+# Export: Eingabeparameter + Ergebnisse als Markdown/CSV, per a user request -
+# shared between both tabs (`_input_parameter_rows` is tab-independent; each
+# tab appends its own result rows via `_solved_state_rows` and its own
+# Einwirkung/Traglast rows, then renders through `_rows_to_markdown`/
+# `_rows_to_csv`). Every row is a (Kategorie, Parameter, Wert) tuple so one
+# flat list serves both a grouped Markdown report and a flat CSV table - see
+# `_rows_to_markdown`/`_rows_to_csv`.
+# ---------------------------------------------------------------------------
+
+def _input_parameter_rows(params: BeamParameters, concrete: ConcreteMaterial, steel: SteelMaterial,
+                           beton_klasse: str, stahl_klasse: str) -> list:
+    """Geometry/reinforcement/material rows - independent of which tab or
+    loading state is being exported, so both `tab_single` and
+    `render_ultimate_tab`'s reports start from the same rows here."""
+    return [
+        ("Geometrie", "Höhe h [mm]", f"{params.height * 1000:.0f}"),
+        ("Geometrie", "Breite b [mm]", f"{params.width * 1000:.0f}"),
+        ("Geometrie", "Bewehrungsüberdeckung c_nom [mm]", f"{params.cover * 1000:.0f}"),
+        ("Geometrie", "Bügeldurchmesser [mm]", f"{params.stirrup_diameter:.0f}"),
+        ("Bewehrung", "Obere Bewehrung (sup)",
+         f"{params.top.n_bars} × ⌀{params.top.diameter:.0f} mm (A={params.top.area_total_mm2:.0f} mm²)"),
+        ("Bewehrung", "Untere Bewehrung (inf)",
+         f"{params.bottom.n_bars} × ⌀{params.bottom.diameter:.0f} mm (A={params.bottom.area_total_mm2:.0f} mm²)"),
+        ("Beton", "Sorte", beton_klasse),
+        ("Beton", "f_ck [N/mm²]", f"{concrete.fck:.1f}"),
+        ("Beton", "E_cm [N/mm²]", f"{concrete.Ecm:.0f}"),
+        ("Beton", "f_ctm [N/mm²]", f"{concrete.fctm:.2f}"),
+        ("Beton", "f_cd [N/mm²]", f"{concrete.f_cd:.2f}"),
+        ("Beton", "eps_c1d [‰]", f"{concrete.eps_c1d * 1000:.2f}"),
+        ("Beton", "eps_c2d [‰]", f"{concrete.eps_c2d * 1000:.2f}"),
+        ("Beton", "Betonzugfestigkeit berücksichtigt", "Ja" if concrete.include_tensile_strength else "Nein"),
+        ("Betonstahl", "Sorte", stahl_klasse),
+        ("Betonstahl", "f_y [N/mm²]", f"{steel.fy:.1f}"),
+        ("Betonstahl", "f_t [N/mm²]", f"{steel.fu:.1f}"),
+        ("Betonstahl", "E_s [N/mm²]", f"{steel.Es:.0f}"),
+        ("Betonstahl", "eps_su [‰]", f"{steel.eps_su * 1000:.2f}"),
+    ]
+
+
+def _solved_state_rows(category: str, section: LayeredBeamSection, params: BeamParameters,
+                        steel: SteelMaterial, result) -> list:
+    """eps0/kappa, steel/concrete fibre stresses, force resultants, and the
+    ductility check for one solved (converged) state - shared by both tabs'
+    reports, grouped under the caller's own `category` label (so a Traglast
+    report's state can read "Ergebnis bei Traglast" rather than a bare
+    "Ergebnis", without a second near-duplicate function)."""
+    _, layer_data = section.internal_forces(result.eps0, result.kappa)
+    bottom_resp = next(s for kind, z, s in layer_data if kind == "reinforcement" and z > 0)
+    top_resp = next(s for kind, z, s in layer_data if kind == "reinforcement" and z < 0)
+    concrete_entries = [(z, s) for kind, z, s in layer_data if kind == "concrete"]
+    sigma_c_bottom = concrete_entries[-1][1]
+    sigma_c_top = concrete_entries[0][1]
+
+    rows = [
+        (category, "eps_0 [‰]", f"{result.eps0 * 1000:.4f}"),
+        (category, "kappa [mrad/m]", f"{result.kappa * 1000:.4f}"),
+        (category, "sigma_s,inf [N/mm²]", f"{bottom_resp.sigma:.1f}"),
+        (category, "sigma_s,sup [N/mm²]", f"{top_resp.sigma:.1f}"),
+        (category, "sigma_c,inf [N/mm²]", f"{sigma_c_bottom.sigma:.2f}"),
+        (category, "sigma_c,sup [N/mm²]", f"{sigma_c_top.sigma:.2f}"),
+    ]
+
+    fr = section.force_resultants(result.eps0, result.kappa)
+    if fr.concrete_compression_centroid_z is not None:
+        rows.append((category, "F_c [kN]",
+                     f"{fr.concrete_compression:.1f} (bei z_c={fr.concrete_compression_centroid_z * 1000:.1f} mm)"))
+    else:
+        rows.append((category, "F_c [kN]", "0 (kein Beton in Druckzone)"))
+    rows.append((category, "F_s,inf [kN]", f"{fr.bottom_steel_force:.1f}"))
+    rows.append((category, "F_s,sup [kN]", f"{fr.top_steel_force:.1f}"))
+
+    ductility = compression_zone_check(params, steel, result.eps0, result.kappa)
+    if ductility is not None:
+        rows.append((category, "x_c [mm]", f"{ductility.x_c * 1000:.1f}"))
+        rows.append((category, "d_s [mm]", f"{ductility.d_s * 1000:.1f}"))
+        rows.append((category, "x_c/d_s",
+                     f"{ductility.ratio:.3f} ({'eingehalten' if ductility.ok else 'nicht eingehalten'}, "
+                     f"Grenzwert {ductility.limit:.3f})"))
+    return rows
+
+
+def _rows_to_markdown(title: str, rows: list) -> str:
+    """Renders (Kategorie, Parameter, Wert) rows as a Markdown report, one
+    `##` section per distinct category in the order rows were appended
+    (Python dicts/the row list itself, not an alphabetical sort - so
+    "Geometrie" through "Ergebnis"/"Traglast" stay in the natural reading
+    order each caller built them in)."""
+    lines = [f"# beam_layer – {title}", "", f"Datum: {datetime.now():%Y-%m-%d %H:%M}"]
+    last_category = None
+    for category, label, value in rows:
+        if category != last_category:
+            lines.append(f"\n## {category}\n")
+            last_category = category
+        lines.append(f"- **{label}:** {value}")
+    return "\n".join(lines) + "\n"
+
+
+def _rows_to_csv(rows: list) -> str:
+    """Same rows, flattened to a 3-column CSV (Kategorie, Parameter, Wert) -
+    for spreadsheet import rather than reading, the other half of "als .md
+    oder .csv" per a user request. `csv.writer` (not manual string joining)
+    handles quoting fields that contain commas - several `Wert` entries here
+    do (e.g. the F_c row's "(bei z_c=...)" aside)."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Kategorie", "Parameter", "Wert"])
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+def _export_tag(prefix: str, n_x: float, m_y: float) -> str:
+    """Filename stem shared by the data-export buttons - same parameter-
+    encoding idea as `_svg_export_config`'s own tag (geometry + the actual
+    N_x/M_y being reported), plus a timestamp so repeated exports in one
+    session don't overwrite each other."""
+    return (f"{prefix}_h{params.height * 1000:.0f}_b{params.width * 1000:.0f}_"
+            f"Nx{n_x:.0f}_My{m_y:.0f}_{datetime.now():%Y%m%d-%H%M%S}")
+
+
+def _render_export_buttons(title: str, file_prefix: str, rows: list, n_x: float, m_y: float,
+                            key_suffix: str) -> None:
+    """The "Eingabe & Ergebnisse exportieren" expander both tabs show below
+    their results - per a user request for a button to save the input
+    parameters and the output as a .md or .csv file (both tabs)."""
+    tag = _export_tag(file_prefix, n_x, m_y)
+    with st.expander("Eingabe & Ergebnisse exportieren", expanded=False):
+        col_md, col_csv = st.columns(2)
+        col_md.download_button(
+            "📄 Als Markdown (.md)", data=_rows_to_markdown(title, rows), file_name=f"{tag}.md",
+            mime="text/markdown", key=f"export_md_{key_suffix}",
+        )
+        col_csv.download_button(
+            "📊 Als CSV (.csv)", data=_rows_to_csv(rows), file_name=f"{tag}.csv", mime="text/csv",
+            key=f"export_csv_{key_suffix}",
+        )
 
 
 _tab_labels = ["Einzellastanalyse"]
@@ -1595,11 +1797,11 @@ with tab_single:
          concrete_points, eps_max_concrete) = _live_material_curves()
         steel_chart_slot.plotly_chart(
             steel_characteristic_figure(eps_range_steel, sigma_range_steel, steel_points, eps_max_steel),
-            width="stretch", config=CHAR_CONFIG,
+            width="stretch", config=_svg_export_config("stahl", dir_n_x, dir_m_y),
         )
         concrete_chart_slot.plotly_chart(
             concrete_characteristic_figure(concrete, concrete_points, eps_max_concrete),
-            width="stretch", config=CHAR_CONFIG,
+            width="stretch", config=_svg_export_config("beton", dir_n_x, dir_m_y),
         )
 
         force_resultants_for_elevation = None
@@ -1609,7 +1811,7 @@ with tab_single:
             force_resultants_for_elevation = _r_section.force_resultants(_r_result.eps0, _r_result.kappa)
         geometry_slot.plotly_chart(
             combined_geometry_figure(params, dir_n_x, dir_m_y, force_resultants_for_elevation),
-            width="stretch", config=CROSS_SECTION_CONFIG,
+            width="stretch", config=_svg_export_config("querschnitt", dir_n_x, dir_m_y),
         )
 
         if "result" in st.session_state:
@@ -1647,6 +1849,24 @@ with tab_single:
                 )
 
             _render_solved_state_plots(section, params, steel, result, key_suffix="single")
+
+            _export_rows = _input_parameter_rows(params, concrete, steel, beton_klasse, stahl_klasse)
+            _export_rows += [
+                ("Einwirkung", "N_x [kN]", f"{direction_for_result.n_x:.2f}"),
+                ("Einwirkung", "M_y [kNm]", f"{direction_for_result.m_y:.2f}"),
+                ("Ergebnis", "Konvergiert", "Ja" if result.converged else "Nein"),
+                ("Ergebnis", "Iterationen", str(result.iterations)),
+                ("Ergebnis", "Residuum", f"{result.residual_norm:.3e}"),
+            ]
+            _export_rows += _solved_state_rows("Ergebnis", section, params, steel, result)
+            if diagnosis is not None:
+                _export_rows.append(("Ergebnis", "Prognose", _failure_prognosis(diagnosis)))
+                for _i, _reason in enumerate(diagnosis.reasons, 1):
+                    _export_rows.append(("Ergebnis", f"Grund {_i}", _reason))
+            _render_export_buttons(
+                "Einzellastanalyse", "einzellast", _export_rows,
+                direction_for_result.n_x, direction_for_result.m_y, key_suffix="single",
+            )
         else:
             st.info("Auf **Analyse durchführen** klicken.")
 
@@ -1921,17 +2141,20 @@ def render_ultimate_tab() -> None:
      concrete_points, eps_max_concrete) = _live_material_curves(ult_section, ult_solved)
     steel_chart_slot.plotly_chart(
         steel_characteristic_figure(eps_range_steel, sigma_range_steel, steel_points, eps_max_steel),
-        width="stretch", config=CHAR_CONFIG, key="ultimate_steel_chart",
+        width="stretch", config=_svg_export_config("stahl_traglast", dir_n_x, dir_m_y),
+        key="ultimate_steel_chart",
     )
     concrete_chart_slot.plotly_chart(
         concrete_characteristic_figure(concrete, concrete_points, eps_max_concrete),
-        width="stretch", config=CHAR_CONFIG, key="ultimate_concrete_chart",
+        width="stretch", config=_svg_export_config("beton_traglast", dir_n_x, dir_m_y),
+        key="ultimate_concrete_chart",
     )
 
     if "ultimate_result" not in st.session_state:
         geometry_slot.plotly_chart(
             combined_geometry_figure(params, dir_n_x, dir_m_y, None),
-            width="stretch", config=COMBINED_GEOMETRY_NONDEFAULT_TAB_CONFIG, key="ultimate_geometry_chart",
+            width="stretch", config=_svg_export_config("querschnitt_traglast", dir_n_x, dir_m_y),
+            key="ultimate_geometry_chart",
         )
         st.info("Auf **Traglast berechnen** klicken.")
         return
@@ -1940,7 +2163,8 @@ def render_ultimate_tab() -> None:
     if ultimate_result is None:
         geometry_slot.plotly_chart(
             combined_geometry_figure(params, dir_n_x, dir_m_y, None),
-            width="stretch", config=COMBINED_GEOMETRY_NONDEFAULT_TAB_CONFIG, key="ultimate_geometry_chart",
+            width="stretch", config=_svg_export_config("querschnitt_traglast", dir_n_x, dir_m_y),
+            key="ultimate_geometry_chart",
         )
         st.warning(
             f"Bis zur {_ULTIMATE_MAX_KAPPA_SAFETY_CAP:.0f}-fachen Laststeigerung wurde keine "
@@ -1958,7 +2182,8 @@ def render_ultimate_tab() -> None:
     )
     geometry_slot.plotly_chart(
         combined_geometry_figure(params, achieved.n_x, achieved.m_y, force_resultants_ultimate),
-        width="stretch", config=COMBINED_GEOMETRY_NONDEFAULT_TAB_CONFIG, key="ultimate_geometry_chart",
+        width="stretch", config=_svg_export_config("querschnitt_traglast", achieved.n_x, achieved.m_y),
+        key="ultimate_geometry_chart",
     )
 
     # Checked at the actual converged kappa_u state, not ultimate_result.diagnosis's
@@ -1987,6 +2212,23 @@ def render_ultimate_tab() -> None:
 
     if result.converged:
         _render_solved_state_plots(section, params, steel, result, key_suffix="ultimate")
+
+        _export_rows = _input_parameter_rows(params, concrete, steel, beton_klasse, stahl_klasse)
+        _export_rows += [
+            ("Einwirkung (Verhältnis)", "N_x [kN]", f"{ultimate_direction.n_x:.2f}"),
+            ("Einwirkung (Verhältnis)", "M_y [kNm]", f"{ultimate_direction.m_y:.2f}"),
+            ("Traglast", "kappa_u [-]", f"{ultimate_result.kappa_u:.4f}"),
+            ("Traglast", "N_x bei Traglast [kN]", f"{achieved.n_x:.2f}"),
+            ("Traglast", "M_y bei Traglast [kNm]", f"{achieved.m_y:.2f}"),
+            ("Traglast", "Berechnungen total", str(ultimate_result.n_solves)),
+            ("Traglast", "Prognose", prognosis_text),
+        ]
+        for _i, _reason in enumerate(ultimate_result.diagnosis.reasons, 1):
+            _export_rows.append(("Traglast", f"Grund {_i}", _reason))
+        _export_rows += _solved_state_rows("Ergebnis bei Traglast", section, params, steel, result)
+        _render_export_buttons(
+            "Traglastberechnung", "traglast", _export_rows, achieved.n_x, achieved.m_y, key_suffix="ultimate",
+        )
     else:
         # Not expected (see `_find_ultimate_load_auto`'s docstring) - kappa_u is
         # the last factor already confirmed to converge during the search, so
