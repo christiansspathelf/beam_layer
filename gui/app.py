@@ -20,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
@@ -65,7 +64,7 @@ TENSION_STIFFENING = False
 # render_curve_tab()/render_ultimate_tab()'s own bodies are untouched either way -
 # only whether each is called changed (see the tab-construction block and the
 # final `with tab_curve:`/`with tab_ultimate:` calls below).
-SHOW_CURVE_TAB = False
+SHOW_CURVE_TAB = True
 SHOW_ULTIMATE_TAB = True
 
 CHANGELOG_PATH = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
@@ -164,44 +163,27 @@ STAHL_KLASSEN = {
 }
 STAHL_ES_MPA = 200_000.0
 
-plt.rcParams.update({
-    "mathtext.fontset": "cm",
-    "font.family": "serif",
-    "font.size": 9,
-})
-
-# Defensive retry around matplotlib's mathtext parser: under Streamlit's
-# threaded script execution, the first mathtext calls in a process
-# intermittently raise a ParseException on otherwise-valid strings (a
-# matplotlib mathtext-cache race, not a syntax problem) - see
-# shell_layer's original GUI for how this was diagnosed. Retrying a few
-# times absorbs it without changing the font/rendering style.
-import matplotlib.mathtext as _mathtext  # noqa: E402
-
-_orig_mathtext_parse = _mathtext.MathTextParser.parse
-
-
-def _retrying_mathtext_parse(self, s, *args, **kwargs):
-    last_exc = None
-    for _ in range(5):
-        try:
-            return _orig_mathtext_parse(self, s, *args, **kwargs)
-        except Exception as exc:
-            last_exc = exc
-    raise last_exc
-
-
-_mathtext.MathTextParser.parse = _retrying_mathtext_parse
-
 st.set_page_config(page_title="beam_layer", layout="wide")
 st.markdown("<style>.block-container{padding-top:1.5rem;}</style>", unsafe_allow_html=True)
 
 # MathJax for Plotly's own LaTeX typesetting (legend/title text in $...$) -
 # see shell_layer's original GUI docstring for why this injection method
-# (st.html(..., unsafe_allow_javascript=True)) is needed.
+# (st.html(..., unsafe_allow_javascript=True)) is needed. Was MathJax 2.7.5
+# (the old `?config=TeX-MML-AM_CHTML` loader URL, v2-only syntax) until a
+# dependency refresh bumped `plotly` 5.20->7.1.0, which bundles a new
+# Plotly.js major version that **dropped MathJax v2 support outright**
+# (confirmed via Plotly's own v7 migration guide: "Plotly.js now supports
+# MathJax version 3 and version 4 ... support for MathJax version 2 has
+# been removed") - every Plotly-rendered LaTeX label in this app (titles,
+# legend entries, annotations) silently stopped typesetting and showed raw
+# "$...$" source text instead, a user caught this. MathJax v3+'s own
+# bootstrap is a single combined-component script (no `?config=` query
+# string - that loader syntax was v2-specific) - using v4 here since
+# that's what Plotly's own migration guide names as current, and `st.latex`
+# (KaTeX, via Streamlit itself, not this injection) was never affected.
 st.html(
-    '<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js'
-    '?config=TeX-MML-AM_CHTML" type="text/javascript" async></script>',
+    '<script id="MathJax-script" async '
+    'src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/4.1.3/tex-mml-chtml.js"></script>',
     unsafe_allow_javascript=True,
 )
 st.title("Querschnittsanalyse Stahlbeton unter einachsiger Biegung und Normalkraft")
@@ -1870,6 +1852,118 @@ with tab_single:
         else:
             st.info("Auf **Analyse durchführen** klicken.")
 
+
+def kappa_m_figure(path: "MomentCurvaturePath", curve_landmarks) -> go.Figure:
+    """Moment-curvature (M-χ) curve for the "Last-Verformungskurve" tab -
+    Plotly, in the same visual house style as `strain_stress_figure`/
+    `steel_characteristic_figure`/`concrete_characteristic_figure`
+    (mirrored white axis frame, bottom-centered horizontal legend, size-10
+    legend/hover text), per a user request that this plot "should be
+    changed to the style of the stress-strain figures" - this used to be
+    the one remaining matplotlib figure in the whole app (`st.pyplot`,
+    see CLAUDE.md's now-removed note on that call), the rest having long
+    since moved to Plotly. Converting it also means it now gets the same
+    client-side SVG export (`_svg_export_config`) every other result chart
+    in this file already has, which `st.pyplot` could never offer.
+
+    The three landmark markers `find_curve_landmarks` already computes -
+    "cr"/cracking, "y"/first yield, "u"/ultimate, each `None` if not
+    found for this path - stay colour-coded (blue/orange/red) rather than
+    the plain white-fill/black-edge "this is the solved state" marker
+    convention used elsewhere: unlike a single marked state point, these
+    three mark three *different*, independently meaningful stages along
+    one curve, and need to stay visually distinct from each other, not
+    just from the curve itself. This is the one deliberate style
+    deviation from the other figures; everything else (axis frame, fonts,
+    legend placement, hover templates) matches them exactly.
+    """
+    converged_mask = np.array([p.converged for p in path.points])
+    m_vals, kappa_vals = path.m_y, path.kappa * 1000
+
+    # Capture the data-driven axis range *before* adding the elastic reference
+    # line below - its much steeper initial slope would otherwise auto-scale
+    # the plot to itself, squashing the actual nonlinear curve into a sliver.
+    kappa_pad = (kappa_vals.max() - kappa_vals.min()) * 0.05 if len(kappa_vals) > 1 else 1.0
+    m_pad = (max(m_vals) - min(0.0, min(m_vals))) * 0.08 if len(m_vals) else 1.0
+    x_lo, x_hi = min(0.0, kappa_vals.min()) - kappa_pad, kappa_vals.max() + kappa_pad
+    y_lo, y_hi = min(0.0, min(m_vals)) - m_pad, max(m_vals) + m_pad
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=kappa_vals, y=m_vals, mode="lines", line=dict(color="white", width=1.1),
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=kappa_vals[converged_mask], y=m_vals[converged_mask], mode="markers",
+        marker=dict(symbol="circle", size=5, color="white", line=dict(color="black", width=1.1)),
+        name="konvergiert", hovertemplate="χ=%{x:.3f} mrad/m<br>M_y=%{y:.2f} kNm<extra></extra>",
+    ))
+    if np.any(~converged_mask):
+        fig.add_trace(go.Scatter(
+            x=kappa_vals[~converged_mask], y=m_vals[~converged_mask], mode="markers",
+            marker=dict(symbol="circle-open", size=6, color="black", line=dict(color="black", width=1.3)),
+            name="Näherungslösung", hovertemplate="χ=%{x:.3f} mrad/m<br>M_y=%{y:.2f} kNm<extra></extra>",
+        ))
+
+    if curve_landmarks is not None and curve_landmarks.elastic_slope is not None and len(kappa_vals):
+        if curve_landmarks.cracking is not None:
+            kappa_ref_mrad = min(abs(curve_landmarks.cracking.kappa) * 1000 * 2.5, abs(kappa_vals).max())
+        else:
+            kappa_ref_mrad = abs(kappa_vals).max() * 0.15
+        sign = 1.0 if kappa_vals[-1] >= 0 else -1.0
+        elastic_kappa = np.array([0.0, sign * kappa_ref_mrad])
+        elastic_m = curve_landmarks.elastic_slope * (elastic_kappa / 1000.0)
+        fig.add_trace(go.Scatter(
+            x=elastic_kappa, y=elastic_m, mode="lines", line=dict(color="gray", width=1.2, dash="dash"),
+            name="elastisch, ungerissen", hoverinfo="skip",
+        ))
+
+    landmark_style = {
+        "cr": dict(symbol="triangle-up", color="royalblue", label="Rissbildung (cr)"),
+        "y": dict(symbol="square", color="orange", label="Fliessbeginn (y)"),
+        "u": dict(symbol="star", color="firebrick", label="Bruch (u)"),
+    }
+    landmark_values = {
+        "cr": curve_landmarks.cracking if curve_landmarks else None,
+        "y": curve_landmarks.yield_ if curve_landmarks else None,
+        "u": curve_landmarks.ultimate if curve_landmarks else None,
+    }
+    for key, lm in landmark_values.items():
+        if lm is None:
+            continue
+        style = landmark_style[key]
+        kx, my = lm.kappa * 1000, lm.m_y
+        fig.add_trace(go.Scatter(
+            x=[kx], y=[my], mode="markers+text", text=[key], textposition="top right",
+            textfont=dict(size=10, color=style["color"]),
+            marker=dict(symbol=style["symbol"], size=11, color=style["color"],
+                        line=dict(color="black", width=1.0)),
+            name=style["label"],
+            hovertemplate=f"{style['label']}<br>χ=%{{x:.3f}} mrad/m<br>M_y=%{{y:.2f}} kNm<extra></extra>",
+        ))
+
+    fig.add_hline(y=0, line_width=0.6, line_color="white")
+    fig.add_vline(x=0, line_width=0.6, line_color="white")
+    # automargin=True (not needed on the other Plotly figures in this file - their
+    # legends are short enough to fit the fixed margin below) - this legend can grow
+    # to 6 entries (konvergiert/Näherungslösung/elastisch, ungerissen/cr/y/u) and wrap
+    # onto a second row in a narrow Streamlit column; with a *fixed* bottom margin
+    # that wrapped legend row was overlapping (and visually hiding) the x-axis title
+    # entirely instead of just looking cramped - a user caught the title "missing",
+    # not garbled. automargin tells Plotly to grow the margin as needed instead of
+    # clipping/overlapping within the fixed one; margin=dict(b=...) below is now just
+    # the floor it grows from, not a hard cap.
+    fig.update_xaxes(title=r"$\chi\ \left[\text{mrad/m}\right]$", range=[x_lo, x_hi],
+                      showline=True, linecolor="white", linewidth=1, mirror=True, automargin=True)
+    fig.update_yaxes(title=r"$M_y\ \left[\text{kNm}\right]$", range=[y_lo, y_hi],
+                      showline=True, linecolor="white", linewidth=1, mirror=True, automargin=True)
+    fig.update_layout(
+        height=460, margin=dict(l=55, r=20, t=30, b=70),
+        legend=dict(font=dict(size=10), orientation="h", yanchor="top", y=-0.22, x=0.5, xanchor="center"),
+    )
+    return fig
+
+
 def render_curve_tab() -> None:
     """"Last-Verformungskurve" tab body - kept as a plain function (not a
     `with tab_curve:` block) so it can be skipped entirely (not just hidden)
@@ -1949,67 +2043,22 @@ def render_curve_tab() -> None:
                     "nicht vorkommen. Eingaben prüfen (z. B. sehr hohe Bruchdehnungen)."
                 )
 
-            fig2, ax2 = plt.subplots(figsize=(6, 4.5))
-            converged_mask = np.array([p.converged for p in path.points])
-            m_vals, kappa_vals = path.m_y, path.kappa * 1000
-
-            ax2.plot(kappa_vals, m_vals, "-", color="black", linewidth=0.8)
-            ax2.plot(kappa_vals[converged_mask], m_vals[converged_mask], "o", color="black",
-                     markersize=4, label="konvergiert")
-            if np.any(~converged_mask):
-                ax2.plot(kappa_vals[~converged_mask], m_vals[~converged_mask], "o", markerfacecolor="none",
-                          markeredgecolor="black", markersize=5, label="Näherungslösung")
-
-            # Capture the data-driven axis range *before* adding the elastic reference
-            # line below - its much steeper initial slope would otherwise auto-scale
-            # the plot to itself, squashing the actual nonlinear curve into a sliver.
-            kappa_pad = (kappa_vals.max() - kappa_vals.min()) * 0.05 if len(kappa_vals) > 1 else 1.0
-            m_pad = (max(m_vals) - min(0.0, min(m_vals))) * 0.08 if len(m_vals) else 1.0
-            x_lo, x_hi = min(0.0, kappa_vals.min()) - kappa_pad, kappa_vals.max() + kappa_pad
-            y_lo, y_hi = min(0.0, min(m_vals)) - m_pad, max(m_vals) + m_pad
-
-            if curve_landmarks is not None and curve_landmarks.elastic_slope is not None and len(kappa_vals):
-                if curve_landmarks.cracking is not None:
-                    kappa_ref_mrad = min(abs(curve_landmarks.cracking.kappa) * 1000 * 2.5, abs(kappa_vals).max())
-                else:
-                    kappa_ref_mrad = abs(kappa_vals).max() * 0.15
-                sign = 1.0 if kappa_vals[-1] >= 0 else -1.0
-                elastic_kappa = np.array([0.0, sign * kappa_ref_mrad])
-                elastic_m = curve_landmarks.elastic_slope * (elastic_kappa / 1000.0)
-                ax2.plot(elastic_kappa, elastic_m, "--", color="tab:gray", linewidth=1.2,
-                         label="elastisch, ungerissen")
-
-            landmark_style = {
-                "cr": dict(marker="^", color="tab:blue", label="Rissbildung (cr)"),
-                "y": dict(marker="s", color="tab:orange", label="Fliessbeginn (y)"),
-                "u": dict(marker="*", color="tab:red", label="Bruch (u)"),
-            }
-            landmark_values = {
-                "cr": curve_landmarks.cracking if curve_landmarks else None,
-                "y": curve_landmarks.yield_ if curve_landmarks else None,
-                "u": curve_landmarks.ultimate if curve_landmarks else None,
-            }
-            for key, lm in landmark_values.items():
-                if lm is None:
-                    continue
-                style = landmark_style[key]
-                kx, my = lm.kappa * 1000, lm.m_y
-                ax2.plot([kx], [my], marker=style["marker"], color=style["color"], markersize=9,
-                         linestyle="none", label=style["label"], zorder=5)
-                ax2.annotate(key, (kx, my), textcoords="offset points", xytext=(6, 6),
-                             fontsize=9, color=style["color"])
-
-            ax2.axhline(0, color="black", linewidth=0.5)
-            ax2.axvline(0, color="black", linewidth=0.5)
-            ax2.set_xlim(x_lo, x_hi)
-            ax2.set_ylim(y_lo, y_hi)
-            ax2.set_xlabel(r"$\chi$ [mrad/m]")
-            ax2.set_ylabel(r"$M_y$ [kNm]")
-            ax2.legend(fontsize=7, loc="best")
-            ax2.grid(True, linewidth=0.3)
-
-            fig2.tight_layout()
-            st.pyplot(fig2)
+            # Plotly now (kappa_m_figure), not matplotlib/st.pyplot - per a user
+            # request to match the "stress-strain figure" house style; see that
+            # function's own docstring. key= is required here for the same
+            # StreamlitDuplicateElementId reason as the two plotly_chart calls
+            # below (three tabs render simultaneously - see CLAUDE.md), and the
+            # chart now gets the same client-side SVG export every other result
+            # chart in this file has - tagged by the swept direction itself
+            # (path.direction), since this plot depicts the whole curve for that
+            # direction, not one specific point on it.
+            st.plotly_chart(
+                kappa_m_figure(path, curve_landmarks),
+                width="stretch",
+                config=_svg_export_config("momenten_kruemmungs_kurve",
+                                           float(path.direction.n_x), float(path.direction.m_y)),
+                key="kappa_m_curve",
+            )
 
             if not curve_landmarks or curve_landmarks.cracking is None:
                 st.caption(
@@ -2033,8 +2082,22 @@ def render_curve_tab() -> None:
             _render_force_resultants(selected_resultants)
             point_col1, point_col2 = st.columns(2)
             with point_col1:
-                st.plotly_chart(strain_stress_figure(curve_section, selected.eps0, selected.kappa),
-                                 width="stretch", config=dict(responsive=True))
+                # Explicit key= (and, per the SVG-export convention used
+                # elsewhere, a traceable filename via _svg_export_config) -
+                # with the curve tab now shown alongside tab_single/
+                # tab_ultimate, an identical (section, eps0, kappa) state
+                # (e.g. the curve's own last point matching tab_single's own
+                # solved state) would otherwise collide on an auto-derived
+                # element id, the same StreamlitDuplicateElementId failure
+                # mode that `key_suffix="single"/"ultimate"` already guards
+                # against between those two tabs - see CLAUDE.md.
+                st.plotly_chart(
+                    strain_stress_figure(curve_section, selected.eps0, selected.kappa),
+                    width="stretch",
+                    config=_svg_export_config(f"dehnung_spannung_kurve_punkt{point_index + 1}",
+                                               float(selected.forces[0]), float(selected.forces[1])),
+                    key="strain_stress_curve",
+                )
             with point_col2:
                 # width="content", matching the single-load tab's call site - this
                 # figure now always computes its own exact pixel width
@@ -2043,7 +2106,7 @@ def render_curve_tab() -> None:
                 st.plotly_chart(
                     beam_elevation_figure(curve_section.params, float(selected.forces[0]),
                                            float(selected.forces[1]), selected_resultants),
-                    width="content", config=CROSS_SECTION_CONFIG,
+                    width="content", config=CROSS_SECTION_CONFIG, key="beam_elevation_curve",
                 )
         else:
             st.info("Auf **Last-Verformungskurve berechnen** klicken.")
